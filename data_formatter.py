@@ -1,6 +1,7 @@
 # data_formatter.py
 
 import logging
+import os
 from typing import List
 from transformers import AutoTokenizer
 from datasets import Dataset, DatasetDict

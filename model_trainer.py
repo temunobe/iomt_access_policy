@@ -1,5 +1,3 @@
-# model_trainer.py
-
 import os
 import logging
 import torch
@@ -19,7 +17,7 @@ logger = logging.getLogger(__name__)
 class ModelTrainer:
     """Train Llama (QLoRA fallback aware)"""
 
-    def __init__(self, model_name: str = "meta-llama/Llama-4-Scout-17B-16E-Instruct", output_dir: str = "./llama4_iomt_model"):
+    def __init__(self, model_name: str = "meta-llama/Llama-4-Scout", output_dir: str = "./llama4_iomt_model"):
         self.model_name = model_name
         self.output_dir = output_dir
         self.gpu_specs = self._detect_gpu_specs()
@@ -82,7 +80,7 @@ class ModelTrainer:
                     quantization_config=bnb_config,
                     device_map="auto",
                     trust_remote_code=True,
-                    dtype=torch.bfloat16,
+                    torch_dtype=torch.bfloat16,
                     local_files_only=os.path.exists(self.model_name)
                 )
                 self.model = prepare_model_for_kbit_training(self.model)
@@ -98,7 +96,7 @@ class ModelTrainer:
             self.model_name,
             device_map="auto" if torch.cuda.is_available() else None,
             trust_remote_code=True,
-            dtype=dtype,
+            torch_dtype=dtype,
             local_files_only=os.path.exists(self.model_name)
         )
 
@@ -118,7 +116,7 @@ class ModelTrainer:
             output_dir=self.output_dir,
             num_train_epochs=num_epochs,
             per_device_train_batch_size=batch_size,
-            per_device_eval_batch_size=batch_size,
+            per_device_eval_batch_size=1,  # Reduced for memory
             gradient_accumulation_steps=grad_accum,
             gradient_checkpointing=True,
             learning_rate=learning_rate,
@@ -126,16 +124,19 @@ class ModelTrainer:
             warmup_ratio=0.05,
             lr_scheduler_type="cosine_with_restarts",
             optim="adamw_torch_fused" if torch.cuda.is_available() else "adamw_torch",
-            bf16=True if torch.cuda.is_available() else False,
+            bf16=True,
             logging_steps=10,
             eval_strategy="steps",
-            eval_steps=100,
+            eval_steps=50,  # Reduced for faster iteration
             save_strategy="steps",
-            save_steps=500,
-            save_total_limit=2,
+            save_steps=100,  # Reduced
+            save_total_limit=1,  # Only keep 1 checkpoint
             load_best_model_at_end=True,
-            dataloader_num_workers=0,
+            dataloader_num_workers=0,  # Reduced to save memory
+            dataloader_pin_memory=False,  # Reduced for memory
             report_to="tensorboard",
+            max_grad_norm=1.0,
+            remove_unused_columns=False,
         )
 
         data_collator = DataCollatorForLanguageModeling(tokenizer=self.tokenizer, mlm=False)

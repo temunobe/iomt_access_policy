@@ -11,17 +11,19 @@ from evaluator import ModelEvaluator
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+os.environ["TOKENIZERS_PARALLELISM"] = 'true'
+
 def main():
     config = {
         # <-- UPDATE THESE PATHS TO YOUR ENVIRONMENT
         "dataset_csv": "/data/user/bsindala/PhD/Research/DataSets/clinical_access_control_scenarios.csv",
         "model_name": "/data/user/bsindala/PhD/Research/LLM_models/meta-llama/Llama-4-Scout-17B-16E-Instruct",
         "model_output": "./llama4_iomt_model",
-        "epochs": 3,
+        "epochs": 1, #3, Testing
         "learning_rate": 1e-5,
-        "batch_size": 4,
-        "grad_accumulation": 8,
-        "eval_sample_size": None
+        "batch_size": 1, # 4, For memory efficiency
+        "grad_accumulation": 16, # 8, Smaller batch compensation
+        "eval_sample_size": 100, #None
     }
 
     logger.info("1/5 LOADING DATASET")
