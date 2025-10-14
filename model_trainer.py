@@ -6,6 +6,7 @@ import torch
 from transformers import (AutoTokenizer, AutoModelForCausalLM, TrainingArguments, Trainer,
                          BitsAndBytesConfig, DataCollatorForLanguageModeling)
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+import importlib
 
 logger = logging.getLogger(__name__)
 
@@ -22,31 +23,74 @@ class ModelTrainer:
         self.tokenizer.pad_token = self.tokenizer.pad_token or self.tokenizer.eos_token
         self.model = None
 
+    def _bnb_available(self) -> bool:
+        """
+        Return True if bitsandbytes is importable and provides the native 'nn' module
+        (i.e., the compiled extension). If not available, quantized 4-bit loading
+        will be skipped to avoid AttributeError.
+        """
+        try:
+            bnb = importlib.import_module("bitsandbytes")
+            available = hasattr(bnb, "nn")
+            if not available:
+                logger.warning("bitsandbytes module imported but does not expose 'nn' (probably not compiled for CUDA).")
+            return available
+        except Exception:
+            logger.warning("bitsandbytes is not importable in this environment.")
+            return False
+
     def load_model(self):
         logger.info(f"Loading model from {self.model_name}")
+
+        # try to clear any leftover allocation and reduce fragmentation prior to loading
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        local = os.path.exists(self.model_name)
+        # prefer 4-bit QLoRA if bitsandbytes is properly installed/compiled
+        if self._bnb_available():
+            try:
+                logger.info("bitsandbytes available: attempting 4-bit QLoRA load")
+                bnb_cfg = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
+                                            bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=True)
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    self.model_name,
+                    quantization_config=bnb_cfg,
+                    device_map="auto",
+                    trust_remote_code=True,
+                    torch_dtype=torch.bfloat16,
+                    local_files_only=local,
+                    low_cpu_mem_usage=True,
+                )
+                self.model = prepare_model_for_kbit_training(self.model)
+                self.model = self._apply_lora()
+                logger.info("✓ Model loaded with 4-bit QLoRA")
+                return
+            except Exception as e:
+                logger.warning(f"4-bit loading with bitsandbytes failed: {e}. Falling back to non-quantized load.")
+
+        # Fallback path (no bitsandbytes / quantization)
+        dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
         try:
-            bnb_cfg = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
-                                        bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=True)
-            local = os.path.exists(self.model_name)
+            logger.info("Loading model without 4-bit quantization (this requires more memory).")
             self.model = AutoModelForCausalLM.from_pretrained(
-                self.model_name, quantization_config=bnb_cfg, device_map="auto",
-                trust_remote_code=True, torch_dtype=torch.bfloat16, local_files_only=local
-            )
-            self.model = prepare_model_for_kbit_training(self.model)
-            self.model = self._apply_lora()
-            logger.info("✓ Model loaded with 4-bit QLoRA")
-        except Exception as e:
-            logger.warning(f"4-bit loading failed: {e}. Loading without quantization.")
-            dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
-            local = os.path.exists(self.model_name)
-            self.model = AutoModelForCausalLM.from_pretrained(
-                self.model_name, device_map="auto" if torch.cuda.is_available() else None,
-                torch_dtype=dtype, trust_remote_code=True, local_files_only=local
+                self.model_name,
+                device_map="auto" if torch.cuda.is_available() else None,
+                torch_dtype=dtype,
+                trust_remote_code=True,
+                local_files_only=local,
+                low_cpu_mem_usage=True,
             )
             try:
                 self.model = self._apply_lora()
-            except:
-                logger.info("Skipping LoRA for CPU training")
+            except Exception:
+                logger.info("Skipping LoRA for the fallback (CPU) path or non-compatible model.")
+            logger.info("✓ Model loaded without quantization")
+        except RuntimeError as re:
+            # likely OOM or other runtime error while loading the full model
+            logger.error("Failed to load the non-quantized model (likely OOM).")
+            logger.error(str(re))
+            raise
 
     def _apply_lora(self):
         cfg = LoraConfig(r=64, lora_alpha=32, target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
