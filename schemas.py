@@ -5,7 +5,6 @@ from typing import List, Optional
 
 @dataclass
 class PolicyScenario:
-    """Represents a single training example"""
     scenario_id: str
     description: str
     device_id: str
