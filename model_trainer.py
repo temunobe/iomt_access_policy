@@ -1,5 +1,7 @@
 # model_trainer.py
 
+# model_trainer.py
+
 import os
 import logging
 import torch
@@ -47,6 +49,21 @@ class ModelTrainer:
             torch.cuda.empty_cache()
 
         local = os.path.exists(self.model_name)
+
+        # Choose device_map depending on whether we're in distributed (DDP) or single-process mode:
+        if torch.cuda.is_available():
+            if self.world_size > 1:
+                # Running under torchrun/DDP: do NOT use device_map="auto"
+                # Instead, load onto the local GPU for this process. Note: this requires
+                # the model (or quantized model) to fit on a single GPU for each process.
+                device_map = {"": f"cuda:{self.local_rank}"}
+                logger.info(f"Distributed run detected (world_size={self.world_size}). Loading model onto cuda:{self.local_rank}.")
+            else:
+                device_map = "auto"
+                logger.info("Single-process run detected. Using device_map='auto' to let HF dispatch weights over GPUs.")
+        else:
+            device_map = None
+
         # prefer 4-bit QLoRA if bitsandbytes is properly installed/compiled
         if self._bnb_available():
             try:
@@ -56,7 +73,7 @@ class ModelTrainer:
                 self.model = AutoModelForCausalLM.from_pretrained(
                     self.model_name,
                     quantization_config=bnb_cfg,
-                    device_map="auto",
+                    device_map=device_map,
                     trust_remote_code=True,
                     torch_dtype=torch.bfloat16,
                     local_files_only=local,
@@ -75,7 +92,7 @@ class ModelTrainer:
             logger.info("Loading model without 4-bit quantization (this requires more memory).")
             self.model = AutoModelForCausalLM.from_pretrained(
                 self.model_name,
-                device_map="auto" if torch.cuda.is_available() else None,
+                device_map=device_map if device_map is not None else ( "auto" if torch.cuda.is_available() else None),
                 torch_dtype=dtype,
                 trust_remote_code=True,
                 local_files_only=local,
@@ -90,6 +107,15 @@ class ModelTrainer:
             # likely OOM or other runtime error while loading the full model
             logger.error("Failed to load the non-quantized model (likely OOM).")
             logger.error(str(re))
+            # Provide a clearer actionable message
+            if self.world_size > 1:
+                logger.error("You are running in distributed mode. Loading a full (non-quantized) model onto each GPU may OOM.\n"
+                             "Options:\n"
+                             " - Install/compile bitsandbytes so 4-bit QLoRA works.\n"
+                             " - Run as a single process and use device_map='auto' so the model is sharded across GPUs.\n"
+                             " - Use accelerate/deepspeed/FSDP to shard parameters across processes.\n")
+            else:
+                logger.error("Consider installing bitsandbytes to enable 4-bit quantization or use machines with more GPU memory.")
             raise
 
     def _apply_lora(self):
@@ -98,23 +124,48 @@ class ModelTrainer:
         return get_peft_model(self.model, cfg)
 
     def train(self, train_ds, val_ds, num_epochs=3, lr=1e-5, batch_size=1, grad_accum=16):
-        args = TrainingArguments(
-            output_dir=self.output_dir, num_train_epochs=num_epochs, per_device_train_batch_size=batch_size,
-            per_device_eval_batch_size=1, gradient_accumulation_steps=grad_accum, gradient_checkpointing=True,
-            learning_rate=lr, weight_decay=0.01, warmup_ratio=0.05, lr_scheduler_type="cosine_with_restarts",
-            optim="adamw_torch_fused" if torch.cuda.is_available() else "adamw_torch", bf16=True,
-            logging_steps=10, eval_strategy="steps", eval_steps=100, save_strategy="steps",
-            save_steps=200, save_total_limit=2, load_best_model_at_end=True, max_grad_norm=1.0,
-            ddp_find_unused_parameters=False, ddp_backend="nccl", local_rank=self.local_rank
-        )
+        # When running as a single-process (world_size == 1), some versions of accelerate
+        # will try to call torch.distributed.get_world_size() while creating the PartialState
+        # which raises if the default process group isn't initialized. To avoid that error,
+        # initialize a minimal process group for the local single-process case so accelerate
+        # can introspect safely. We'll destroy it afterwards.
+        created_process_group = False
+        try:
+            if self.world_size == 1 and torch.distributed.is_available() and not torch.distributed.is_initialized():
+                try:
+                    # Use gloo for a lightweight single-process group (works without NCCL requirements).
+                    torch.distributed.init_process_group(backend="gloo", rank=0, world_size=1)
+                    created_process_group = True
+                    logger.info("Initialized lightweight torch.distributed process group (gloo) for single-process accelerate compatibility.")
+                except Exception as e:
+                    # If we can't init, we continue but note that accelerate may error in some environments.
+                    logger.warning(f"Could not initialize torch distributed process group: {e}")
 
-        trainer = Trainer(
-            model=self.model, args=args, train_dataset=train_ds, eval_dataset=val_ds,
-            tokenizer=self.tokenizer, data_collator=DataCollatorForLanguageModeling(self.tokenizer, mlm=False)
-        )
-        trainer.train()
+            args = TrainingArguments(
+                output_dir=self.output_dir, num_train_epochs=num_epochs, per_device_train_batch_size=batch_size,
+                per_device_eval_batch_size=1, gradient_accumulation_steps=grad_accum, gradient_checkpointing=True,
+                learning_rate=lr, weight_decay=0.01, warmup_ratio=0.05, lr_scheduler_type="cosine_with_restarts",
+                optim="adamw_torch_fused" if torch.cuda.is_available() else "adamw_torch", bf16=True,
+                logging_steps=10, eval_strategy="steps", eval_steps=100, save_strategy="steps",
+                save_steps=200, save_total_limit=2, load_best_model_at_end=True, max_grad_norm=1.0,
+                ddp_find_unused_parameters=False, ddp_backend="nccl", local_rank=self.local_rank
+            )
 
-        if self.rank == 0:
-            trainer.save_model(self.output_dir)
-            self.tokenizer.save_pretrained(self.output_dir)
-            logger.info(f"✓ Model saved to {self.output_dir}")
+            trainer = Trainer(
+                model=self.model, args=args, train_dataset=train_ds, eval_dataset=val_ds,
+                tokenizer=self.tokenizer, data_collator=DataCollatorForLanguageModeling(self.tokenizer, mlm=False)
+            )
+            trainer.train()
+
+            if self.rank == 0:
+                trainer.save_model(self.output_dir)
+                self.tokenizer.save_pretrained(self.output_dir)
+                logger.info(f"✓ Model saved to {self.output_dir}")
+        finally:
+            # Destroy the process group we created to avoid warnings on exit.
+            if created_process_group and torch.distributed.is_initialized():
+                try:
+                    torch.distributed.destroy_process_group()
+                    logger.info("Destroyed the temporary torch.distributed process group.")
+                except Exception as e:
+                    logger.warning(f"Failed to destroy process group: {e}")
