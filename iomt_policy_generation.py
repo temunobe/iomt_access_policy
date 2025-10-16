@@ -19,22 +19,58 @@ os.environ["TOKENIZERS_PARALLELISM"] = 'true'
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 def setup_distributed(timeout_min=30):
-    rank = int(os.environ.get("RANK", 0))
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
 
-    if not dist.is_available() or world_size == 1:
+    # Ensure env vars exist for downstream libs
+    os.environ.setdefault("RANK", str(rank))
+    os.environ.setdefault("LOCAL_RANK", str(local_rank))
+    os.environ.setdefault("WORLD_SIZE", str(world_size))
+
+    if not dist.is_available():
         return rank, local_rank, world_size
+
+    # If already initialized, return
+    if dist.is_initialized():
+        if torch.cuda.is_available():
+            ngpu = torch.cuda.device_count()
+            torch.cuda.set_device(local_rank % max(1, ngpu))
+        return rank, local_rank, world_size
+
+    # Provide sane MASTER_ADDR/MASTER_PORT if not present so we can init a local single-process group
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29500")
+
+    backend = "nccl" if torch.cuda.is_available() else "gloo"
+    init_method = f"tcp://{os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']}"
+
+    try:
+        # Initialize a default process group (works for world_size==1 too)
+        dist.init_process_group(
+            backend=backend,
+            init_method=init_method,
+            rank=rank,
+            world_size=world_size,
+            timeout=datetime.timedelta(minutes=timeout_min),
+        )
+    except Exception as e:
+        logger.warning(f"Could not initialize torch distributed process group: {e}")
+        # Fall back to single-process and ensure no uninitialized group remains
+        try:
+            if dist.is_initialized():
+                dist.destroy_process_group()
+        except Exception:
+            pass
+        os.environ["RANK"] = "0"
+        os.environ["LOCAL_RANK"] = "0"
+        os.environ["WORLD_SIZE"] = "1"
+        return 0, 0, 1
 
     if torch.cuda.is_available():
         ngpu = torch.cuda.device_count()
         torch.cuda.set_device(local_rank % max(1, ngpu))
 
-    if not dist.is_initialized():
-        dist.init_process_group(
-            backend="nccl" if torch.cuda.is_available() else "gloo",
-            init_method="env://", timeout=datetime.timedelta(minutes=timeout_min)
-        )
     return rank, local_rank, world_size
 
 def main():
@@ -70,7 +106,7 @@ def main():
     if rank == 0:
         logger.info("Training model...")
     trainer = ModelTrainer(model_name=cfg["model_name"], output_dir=cfg["model_output"])
-    trainer.load_model()
+    trainer.load_model(for_training=True)
     trainer.train(
         tokenized["train"] if rank == 0 else None,
         tokenized["validation"] if rank == 0 else None,
