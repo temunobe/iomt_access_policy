@@ -1,1 +1,4 @@
 .env
+iomtenv/
+__pycache__/
+config.py
