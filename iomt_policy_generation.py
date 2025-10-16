@@ -10,6 +10,7 @@ from data_formatter import DataFormatter
 from model_trainer import ModelTrainer
 from policy_generator import PolicyGenerator
 from evaluator import ModelEvaluator
+from config import cfg
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -40,13 +41,6 @@ def main():
     rank, local_rank, world_size = setup_distributed()
     if rank != 0:
         logging.getLogger().setLevel(logging.WARNING)
-
-    cfg = {
-        "model_name": "/data/user/bsindala/PhD/Research/LLM_models/meta-llama/Llama-4-Scout-17B-16E-Instruct",
-        "dataset_csv": "/data/user/bsindala/PhD/Research/DataSets/clinical_access_control_scenarios.csv",
-        "model_output": "./llama4_model",
-        "epochs": 3, "lr": 1e-5, "batch": 1, "grad_accum": 32, "eval_size": 50
-    }
 
     if rank == 0:
         logger.info("="*50)
