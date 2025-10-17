@@ -56,10 +56,14 @@ def setup_distributed(timeout_minutes: int = 30):
     if torch.distributed.is_initialized():
         return rank, local_rank, world_size
 
-    # For single-process execution (world_size == 1), skip distributed init
-    if world_size == 1:
-        print(f"[rank {rank}] Single process detected, skipping distributed initialization")
-        return rank, local_rank, world_size
+    # For single-process execution (world_size == 1), we still initialize
+    # a (local) process group. Some libraries (accelerate/transformers)
+    # call torch.distributed.get_world_size() and expect a default
+    # process group to exist even in single-process mode. Initializing
+    # a single-process group avoids "Default process group has not been
+    # initialized" errors while being a no-op for multi-process runs
+    # where the group is already created by torchrun.
+    # Note: if the process group is already initialized we return early above.
 
     # Set MASTER_ADDR and MASTER_PORT if not set (for single-node multi-GPU)
     if "MASTER_ADDR" not in os.environ:
@@ -72,6 +76,38 @@ def setup_distributed(timeout_minutes: int = 30):
 
     backend = "nccl" if torch.cuda.is_available() else "gloo"
     
+    # If single-process, try to create a local process group so libraries
+    # that expect a default group (accelerate/transformers) won't fail.
+    if world_size == 1:
+        try:
+            torch.distributed.init_process_group(
+                backend=backend,
+                init_method="env://",
+                world_size=1,
+                rank=rank,
+                timeout=timeout,
+            )
+            print(f"[rank {rank}] Initialized single-process distributed group with {backend}")
+            return rank, local_rank, world_size
+        except Exception as e:
+            print(f"[rank {rank}] env:// single-process init failed: {e}; trying file-based init")
+            # Try a file-based init as a last resort for single-node single-process
+            try:
+                import tempfile
+                tmpf = tempfile.mktemp()
+                file_url = f"file://{tmpf}"
+                torch.distributed.init_process_group(
+                    backend=backend,
+                    init_method=file_url,
+                    world_size=1,
+                    rank=rank,
+                    timeout=timeout,
+                )
+                print(f"[rank {rank}] Initialized single-process distributed group with file:// init and {backend}")
+                return rank, local_rank, world_size
+            except Exception as e2:
+                print(f"[rank {rank}] file:// single-process init failed: {e2}; continuing without process group")
+
     try:
         torch.distributed.init_process_group(
             backend=backend,
