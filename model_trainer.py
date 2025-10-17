@@ -3,6 +3,7 @@
 import os
 import logging
 import torch
+import gc
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
@@ -24,12 +25,17 @@ class ModelTrainer:
         self.gpu_specs = self._detect_gpu_specs()
         logger.info(f"GPU Config: {self.gpu_specs}")
         
-        # Get distributed training info (torchrun sets these automatically)
+        # Get distributed training info
         self.rank = int(os.environ.get("RANK", 0))
         self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
         self.world_size = int(os.environ.get("WORLD_SIZE", 1))
         
         logger.info(f"Trainer initialized - rank={self.rank}, local_rank={self.local_rank}, world_size={self.world_size}")
+        
+        # CRITICAL: Clear GPU cache before loading anything
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            gc.collect()
 
         # Load tokenizer
         if os.path.exists(model_name):
@@ -46,29 +52,15 @@ class ModelTrainer:
             gpu_count = torch.cuda.device_count()
             gpu_name = torch.cuda.get_device_name(0)
             gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1e9
+            
+            # Log memory usage
+            for i in range(gpu_count):
+                allocated = torch.cuda.memory_allocated(i) / 1e9
+                reserved = torch.cuda.memory_reserved(i) / 1e9
+                logger.info(f"GPU {i} - Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB")
+            
             return {"count": gpu_count, "name": gpu_name, "memory_gb": gpu_memory}
         return {"count": 0, "name": "CPU", "memory_gb": 0}
-
-    def _safe_from_pretrained(self, *args, **kwargs):
-        """Call AutoModelForCausalLM.from_pretrained but gracefully handle
-        models that don't support Flash Attention 2.0 by retrying without
-        the attn_implementation kwarg.
-
-        This avoids the exception raised by some model class implementations
-        in Transformers which haven't added support for the newer attn
-        backend.
-        """
-        try:
-            return AutoModelForCausalLM.from_pretrained(*args, **kwargs)
-        except ValueError as e:
-            msg = str(e)
-            # Detect the specific Flash Attention 2.0 complaint and retry
-            if "Flash Attention 2.0" in msg or "flash_attention_2" in msg or "flash attention" in msg.lower():
-                logger.warning("Model class does not support Flash Attention 2.0; retrying without attn_implementation...")
-                kwargs.pop("attn_implementation", None)
-                return AutoModelForCausalLM.from_pretrained(*args, **kwargs)
-            # Re-raise if it's some other ValueError
-            raise
 
     def _apply_qlora(self):
         logger.info("Applying QLoRA adapters...")
@@ -89,61 +81,129 @@ class ModelTrainer:
 
     def load_model(self):
         logger.info(f"Loading model: {self.model_name}")
+        
+        # Aggressive memory cleanup before loading
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            gc.collect()
+            logger.info("Cleared CUDA cache before model loading")
 
-        try:
-            bnb_config = BitsAndBytesConfig(
-                load_in_8bit=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_8bit_compute_dtype=torch.bfloat16,
-                bnb_8bit_use_double_quant=True,
-            )
-        except Exception as e:
-            logger.warning(f"Could not create BitsAndBytesConfig: {e}")
-            bnb_config = None
-
-        if bnb_config is not None:
-            try:
-                logger.info("Loading model with 4-bit quantization (BitsAndBytes)...")
-                self.model = self._safe_from_pretrained(
-                    self.model_name,
-                    quantization_config=bnb_config,
-                    device_map="auto",
-                    trust_remote_code=True,
-                    torch_dtype=torch.bfloat16,
-                    attn_implementation="flash_attention_2",
-                    local_files_only=os.path.exists(self.model_name),
-                    low_cpu_mem_usage=True
-                )
-                self.model = prepare_model_for_kbit_training(self.model)
-                self.model = self._apply_qlora()
-                logger.info("✓ Model loaded with QLoRA")
-                return self.model
-            except Exception as e:
-                logger.warning(f"Quantized loading failed: {e}. Falling back to non-quantized.")
-
-        logger.info("Loading model without quantization.")
-        dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
-        self.model = self._safe_from_pretrained(
-            self.model_name,
-            device_map="auto" if torch.cuda.is_available() else None,
-            trust_remote_code=True,
-            torch_dtype=dtype,
-            attn_implementation="flash_attention_2",
-            local_files_only=os.path.exists(self.model_name),
-            low_cpu_mem_usage=True
+        # SOLUTION 1: Use 4-bit with CPU offloading to manage memory
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.float16,  # Use fp16 instead of bf16
+            bnb_4bit_use_double_quant=True,
         )
 
         try:
-            self.model = prepare_model_for_kbit_training(self.model)
+            logger.info("Loading model with 4-bit quantization...")
+            
+            # SOLUTION 2: Calculate safe max_memory (leave 10GB buffer)
+            if self.gpu_specs['count'] > 0:
+                safe_memory_gb = max(10, self.gpu_specs['memory_gb'] - 10)
+                max_memory_config = {i: f"{safe_memory_gb}GB" for i in range(self.gpu_specs['count'])}
+                # Add CPU offload
+                max_memory_config["cpu"] = "50GB"
+            else:
+                max_memory_config = None
+            
+            logger.info(f"Memory config: {max_memory_config}")
+            
+            self.model = AutoModelForCausalLM.from_pretrained(
+                self.model_name,
+                quantization_config=bnb_config,
+                device_map="auto",
+                trust_remote_code=True,
+                torch_dtype=torch.float16,  # Consistent with quantization
+                local_files_only=os.path.exists(self.model_name),
+                low_cpu_mem_usage=True,
+                max_memory=max_memory_config,
+                # SOLUTION 3: Offload some layers to CPU if needed
+                offload_folder="./offload_tmp",
+                offload_state_dict=True,
+            )
+            
+            logger.info("Model loaded, preparing for k-bit training...")
+            
+            # SOLUTION 4: Don't call prepare_model_for_kbit_training if model is already quantized
+            # The model is already prepared when loaded with quantization_config
+            # Just apply LoRA directly
+            
+            # FIX: Llama 4 MoE doesn't support gradient checkpointing with the router
+            # We'll handle this in TrainingArguments instead
+            # self.model.gradient_checkpointing_enable()  # REMOVED - causes router unpacking error
             self.model = self._apply_qlora()
-        except Exception:
-            logger.info("Skipping QLoRA for non-quantized model.")
-
-        logger.info("✓ Model loaded")
-        return self.model
+            
+            logger.info("✓ Model loaded with QLoRA (4-bit)")
+            
+            # Log final memory usage
+            if torch.cuda.is_available():
+                for i in range(self.gpu_specs['count']):
+                    allocated = torch.cuda.memory_allocated(i) / 1e9
+                    reserved = torch.cuda.memory_reserved(i) / 1e9
+                    logger.info(f"GPU {i} after load - Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB")
+            
+            return self.model
+            
+        except torch.cuda.OutOfMemoryError as e:
+            logger.error(f"OOM Error during quantized load: {e}")
+            logger.info("Attempting recovery: clearing cache and retrying with more aggressive offloading")
+            
+            # Emergency cleanup
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            gc.collect()
+            
+            try:
+                # SOLUTION 5: More aggressive CPU offloading
+                max_memory_config = {}
+                if self.gpu_specs['count'] > 0:
+                    # Use only 60% of GPU memory
+                    conservative_memory = int(self.gpu_specs['memory_gb'] * 0.6)
+                    max_memory_config = {i: f"{conservative_memory}GB" for i in range(self.gpu_specs['count'])}
+                max_memory_config["cpu"] = "100GB"
+                
+                logger.info(f"Retry with conservative memory config: {max_memory_config}")
+                
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    self.model_name,
+                    quantization_config=bnb_config,
+                    device_map="balanced",  # Try balanced instead of auto
+                    trust_remote_code=True,
+                    torch_dtype=torch.float16,
+                    local_files_only=os.path.exists(self.model_name),
+                    low_cpu_mem_usage=True,
+                    max_memory=max_memory_config,
+                    offload_folder="./offload_tmp",
+                    offload_state_dict=True,
+                )
+                
+                self.model.gradient_checkpointing_enable()
+                self.model = self._apply_qlora()
+                logger.info("✓ Model loaded with conservative settings")
+                return self.model
+                
+            except Exception as e2:
+                logger.error(f"Failed even with conservative settings: {e2}")
+                raise RuntimeError(
+                    "Cannot load model even with aggressive CPU offloading. "
+                    "Suggestions:\n"
+                    "1. Kill other GPU processes: nvidia-smi to identify, kill -9 <PID>\n"
+                    "2. Use multiple GPUs with model parallelism\n"
+                    "3. Use a smaller model or reduce LoRA rank\n"
+                    "4. Try running on CPU (very slow): device_map='cpu'"
+                ) from e2
 
     def train(self, train_dataset, eval_dataset, num_epochs=1, learning_rate=1e-5, batch_size=1, grad_accum=16):
         logger.info("STARTING DISTRIBUTED TRAINING")
+        
+        # Clear cache before training
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            gc.collect()
         
         training_args = TrainingArguments(
             output_dir=self.output_dir,
@@ -151,19 +211,14 @@ class ModelTrainer:
             per_device_train_batch_size=batch_size,
             per_device_eval_batch_size=1,
             gradient_accumulation_steps=grad_accum,
-            # Gradient checkpointing can reduce memory but is known to interact
-            # poorly with some attention/optimized kernels and mixed precision on
-            # certain GPU/driver combinations. Disable by default to avoid
-            # illegal memory access errors during early debugging runs.
-            gradient_checkpointing=False,
+            gradient_checkpointing=True,  # Enable to save memory during training
+            gradient_checkpointing_kwargs={"use_reentrant": False},
             learning_rate=learning_rate,
             weight_decay=0.01,
             warmup_ratio=0.05,
             lr_scheduler_type="cosine_with_restarts",
             optim="adamw_torch_fused" if torch.cuda.is_available() else "adamw_torch",
-            # Disable bf16 by default; some GPUs or driver setups do not
-            # support bfloat16 reliably. If you have A100/regular bf16 support
-            # and stable kernels, you can set this to True for speed/memory.
+            fp16=torch.cuda.is_available(),
             bf16=False,
             logging_steps=10,
             eval_strategy="steps",
@@ -174,15 +229,19 @@ class ModelTrainer:
             load_best_model_at_end=True,
             dataloader_num_workers=2,
             dataloader_pin_memory=True,
-            # Avoid requiring tensorboard to be installed in all environments;
-            # use an empty list to disable integrations by default.
             report_to=[],
             max_grad_norm=1.0,
             remove_unused_columns=False,
-            # Distributed training settings
             ddp_find_unused_parameters=False,
-            ddp_backend="nccl",
+            ddp_backend="nccl" if torch.cuda.is_available() else "gloo",
             local_rank=self.local_rank,
+            ddp_timeout=3600,
+            # SOLUTION 6: More aggressive memory management during training
+            max_steps=-1,
+            logging_first_step=True,
+            # Enable these to reduce memory usage
+            eval_accumulation_steps=4,
+            save_safetensors=True,
         )
 
         data_collator = DataCollatorForLanguageModeling(tokenizer=self.tokenizer, mlm=False)
@@ -198,21 +257,21 @@ class ModelTrainer:
 
         try:
             trainer.train()
+        except torch.cuda.OutOfMemoryError as e:
+            logger.error(f"OOM during training: {e}")
+            logger.error("Try reducing batch_size to 1 and grad_accum to 4")
+            raise
         except Exception as e:
-            # Provide targeted debugging hints for CUDA illegal memory access
             logger.error("Training failed with exception: %s", e)
-            if "CUDA error" in str(e) or "cuda" in str(e).lower() or "illegal memory access" in str(e).lower():
-                logger.error("Detected CUDA error during training. Try the following to debug:\n"
-                             " 1) Re-run with CUDA_LAUNCH_BLOCKING=1 to get a deterministic stack trace.\n"
-                             "    Example: CUDA_LAUNCH_BLOCKING=1 python iomt_policy_generation.py\n"
-                             " 2) Disable quantization/QLoRA and run on a single GPU with smaller batch size.\n"
-                             " 3) Set gradient_checkpointing=False (already disabled here) and bf16=False (already disabled here).\n"
-                             " 4) Try running on CPU to reproduce the error without CUDA (slower but useful).\n"
-                             " 5) If using custom attention/backends (flash attention, xformers, etc.), ensure versions are compatible with your CUDA/PyTorch.\n")
-            # Re-raise so behavior is unchanged for callers/tests
+            if "CUDA error" in str(e) or "cuda" in str(e).lower():
+                logger.error("CUDA error detected. Debug steps:\n"
+                             " 1) CUDA_LAUNCH_BLOCKING=1 python iomt_policy_generation.py\n"
+                             " 2) Check nvidia-smi for other processes using GPU memory\n"
+                             " 3) Reduce batch size and gradient accumulation\n"
+                             " 4) Use fewer GPUs or single GPU mode")
             raise
         
-        # Save only on rank 0 to avoid conflicts
+        # Save only on rank 0
         if self.rank == 0:
             trainer.save_model(self.output_dir)
             self.tokenizer.save_pretrained(self.output_dir)
