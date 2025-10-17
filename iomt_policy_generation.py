@@ -56,15 +56,6 @@ def setup_distributed(timeout_minutes: int = 30):
     if torch.distributed.is_initialized():
         return rank, local_rank, world_size
 
-    # For single-process execution (world_size == 1), we still initialize
-    # a (local) process group. Some libraries (accelerate/transformers)
-    # call torch.distributed.get_world_size() and expect a default
-    # process group to exist even in single-process mode. Initializing
-    # a single-process group avoids "Default process group has not been
-    # initialized" errors while being a no-op for multi-process runs
-    # where the group is already created by torchrun.
-    # Note: if the process group is already initialized we return early above.
-
     # Set MASTER_ADDR and MASTER_PORT if not set (for single-node multi-GPU)
     if "MASTER_ADDR" not in os.environ:
         os.environ["MASTER_ADDR"] = "localhost"

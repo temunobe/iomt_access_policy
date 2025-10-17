@@ -151,13 +151,20 @@ class ModelTrainer:
             per_device_train_batch_size=batch_size,
             per_device_eval_batch_size=1,
             gradient_accumulation_steps=grad_accum,
-            gradient_checkpointing=True,
+            # Gradient checkpointing can reduce memory but is known to interact
+            # poorly with some attention/optimized kernels and mixed precision on
+            # certain GPU/driver combinations. Disable by default to avoid
+            # illegal memory access errors during early debugging runs.
+            gradient_checkpointing=False,
             learning_rate=learning_rate,
             weight_decay=0.01,
             warmup_ratio=0.05,
             lr_scheduler_type="cosine_with_restarts",
             optim="adamw_torch_fused" if torch.cuda.is_available() else "adamw_torch",
-            bf16=True,
+            # Disable bf16 by default; some GPUs or driver setups do not
+            # support bfloat16 reliably. If you have A100/regular bf16 support
+            # and stable kernels, you can set this to True for speed/memory.
+            bf16=False,
             logging_steps=10,
             eval_strategy="steps",
             eval_steps=100,
@@ -189,7 +196,21 @@ class ModelTrainer:
             data_collator=data_collator
         )
 
-        trainer.train()
+        try:
+            trainer.train()
+        except Exception as e:
+            # Provide targeted debugging hints for CUDA illegal memory access
+            logger.error("Training failed with exception: %s", e)
+            if "CUDA error" in str(e) or "cuda" in str(e).lower() or "illegal memory access" in str(e).lower():
+                logger.error("Detected CUDA error during training. Try the following to debug:\n"
+                             " 1) Re-run with CUDA_LAUNCH_BLOCKING=1 to get a deterministic stack trace.\n"
+                             "    Example: CUDA_LAUNCH_BLOCKING=1 python iomt_policy_generation.py\n"
+                             " 2) Disable quantization/QLoRA and run on a single GPU with smaller batch size.\n"
+                             " 3) Set gradient_checkpointing=False (already disabled here) and bf16=False (already disabled here).\n"
+                             " 4) Try running on CPU to reproduce the error without CUDA (slower but useful).\n"
+                             " 5) If using custom attention/backends (flash attention, xformers, etc.), ensure versions are compatible with your CUDA/PyTorch.\n")
+            # Re-raise so behavior is unchanged for callers/tests
+            raise
         
         # Save only on rank 0 to avoid conflicts
         if self.rank == 0:
