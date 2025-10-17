@@ -167,7 +167,9 @@ class ModelTrainer:
             load_best_model_at_end=True,
             dataloader_num_workers=2,
             dataloader_pin_memory=True,
-            report_to="tensorboard",
+            # Avoid requiring tensorboard to be installed in all environments;
+            # use an empty list to disable integrations by default.
+            report_to=[],
             max_grad_norm=1.0,
             remove_unused_columns=False,
             # Distributed training settings

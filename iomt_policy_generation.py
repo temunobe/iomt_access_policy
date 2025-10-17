@@ -247,6 +247,16 @@ def main():
     if world_size > 1:
         torch.distributed.destroy_process_group()
 
+    # If we initialized a single-process group earlier (world_size==1),
+    # try to destroy it to avoid resource-leak warnings. Guard with
+    # is_initialized check so this is a no-op when nothing was created.
+    try:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
+    except Exception:
+        # Best-effort cleanup; ignore failures during shutdown
+        pass
+
 if __name__ == "__main__":
     # Try to determine rank early so logs are per-process
     rank = int(os.environ.get("RANK", os.environ.get("SLURM_PROCID", "0")))
