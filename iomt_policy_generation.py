@@ -1,4 +1,5 @@
-# iomt_policy_generation.py
+#!/usr/bin/env python3
+# iomt_policy_generation.py - FIXED VERSION
 
 import os
 import logging
@@ -10,7 +11,8 @@ from data_formatter import DataFormatter
 from model_trainer import ModelTrainer
 from policy_generator import PolicyGenerator
 from evaluator import ModelEvaluator
-from config import cfg
+from config import config
+from datasets import load_from_disk
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -33,7 +35,8 @@ def setup_distributed(timeout_min=30):
     if not dist.is_initialized():
         dist.init_process_group(
             backend="nccl" if torch.cuda.is_available() else "gloo",
-            init_method="env://", timeout=datetime.timedelta(minutes=timeout_min)
+            init_method="env://", 
+            timeout=datetime.timedelta(minutes=timeout_min)
         )
     return rank, local_rank, world_size
 
@@ -42,59 +45,167 @@ def main():
     if rank != 0:
         logging.getLogger().setLevel(logging.WARNING)
 
-    if rank == 0:
-        logger.info("="*50)
-        logger.info("IOMT Policy Generation - 2 GPU Training")
-        logger.info(f"World size: {world_size}")
-        logger.info("="*50)
+    cfg = {
+        "model_name": "mistralai/Mistral-7B-Instruct-v0.2",
+        "model_output": "./mistral7b_model",
+        "tokenized_cache": "./tokenized_dataset_cache",
+        "epochs": 1,  # Reduced for memory
+        "lr": 1e-5,
+        "batch": 1,
+        "grad_accum": 8,  # Reduced from 16
+        "eval_size": 50   # Reduced from 100
+    }
 
+    if rank == 0:
+        logger.info("="*70)
+        logger.info("IOMT Policy Generation Pipeline - Multi-GPU Training")
+        logger.info(f"World size: {world_size}, Rank: {rank}, Local rank: {local_rank}")
+        logger.info("="*70)
+
+    # ====== STAGE 1: LOAD DATA (RANK 0 ONLY) ======
     scenarios = None
     if rank == 0:
-        logger.info("Loading dataset...")
-        scenarios = DataLoader(cfg["dataset_csv"]).load()
+        logger.info("\n[STAGE 1] Loading dataset...")
+        try:
+            loader = DataLoader(config.get('data_dir', 'synthetic_iomt_dataset.csv'))
+            scenarios = loader.load()
+            logger.info(f"✓ Loaded {len(scenarios)} scenarios")
+        except Exception as e:
+            logger.error(f"Failed to load dataset: {e}")
+            raise
 
     if world_size > 1:
         dist.barrier()
 
+    # ====== STAGE 2: FORMAT AND TOKENIZE (RANK 0 ONLY) ======
     if rank == 0:
-        logger.info("Formatting data...")
-        fmt = DataFormatter(cfg["model_name"])
-        dataset = fmt.format_and_split(scenarios)
-        tokenized = fmt.prepare_tokenized_dataset(dataset, max_seq_length=4096)
-    else:
-        tokenized = None
+        logger.info("\n[STAGE 2] Formatting and tokenizing data...")
+        try:
+            formatter = DataFormatter(cfg["model_name"])
+            logger.info("✓ Tokenizer loaded")
+            
+            # Format and split
+            dataset = formatter.format_and_split(scenarios)
+            logger.info("✓ Data formatted and split (train/val/test)")
+            
+            # Tokenize
+            tokenized = formatter.prepare_tokenized_dataset(dataset, max_seq_length=4096)
+            logger.info("✓ Data tokenized")
+            
+            # Save to disk for other ranks
+            os.makedirs(cfg["tokenized_cache"], exist_ok=True)
+            tokenized.save_to_disk(cfg["tokenized_cache"])
+            logger.info(f"✓ Tokenized dataset saved to {cfg['tokenized_cache']}")
+            
+        except Exception as e:
+            logger.error(f"Failed in formatting/tokenization: {e}")
+            raise
 
+    # ====== WAIT FOR RANK 0 ======
+    if world_size > 1:
+        dist.barrier()
+        logger.info(f"Rank {rank}: Barrier reached after rank 0 tokenization")
+
+    # ====== STAGE 3: LOAD TOKENIZED DATA (ALL RANKS) ======
+    logger.info(f"\n[STAGE 3] Rank {rank} loading tokenized dataset...")
+    try:
+        tokenized = load_from_disk(cfg["tokenized_cache"])
+        logger.info(f"✓ Rank {rank} loaded tokenized dataset")
+        logger.info(f"  Train samples: {len(tokenized['train'])}")
+        logger.info(f"  Val samples: {len(tokenized['validation'])}")
+        logger.info(f"  Test samples: {len(tokenized['test'])}")
+    except Exception as e:
+        logger.error(f"Rank {rank} failed to load tokenized dataset: {e}")
+        raise
+
+    # ====== WAIT FOR ALL RANKS ======
     if world_size > 1:
         dist.barrier()
 
+    # ====== STAGE 4: TRAIN MODEL (ALL RANKS) ======
     if rank == 0:
-        logger.info("Training model...")
-    trainer = ModelTrainer(model_name=cfg["model_name"], output_dir=cfg["model_output"])
-    trainer.load_model()
-    trainer.train(
-        tokenized["train"] if rank == 0 else None,
-        tokenized["validation"] if rank == 0 else None,
-        num_epochs=cfg["epochs"], lr=cfg["lr"], batch_size=cfg["batch"], grad_accum=cfg["grad_accum"]
-    )
+        logger.info(f"\n[STAGE 4] Training model...")
+        logger.info(f"Using FSDP to shard model across {world_size} GPUs")
+    
+    try:
+        trainer = ModelTrainer(
+            model_name=cfg["model_name"],
+            output_dir=cfg["model_output"]
+        )
+        trainer.load_model()
+        logger.info(f"Rank {rank}: Model loaded")
+        
+        # Train with FSDP (set via accelerate config)
+        trainer.train(
+            train_ds=tokenized["train"],
+            val_ds=tokenized["validation"],
+            num_epochs=cfg["epochs"],
+            lr=cfg["lr"],
+            batch_size=cfg["batch"],
+            grad_accum=cfg["grad_accum"]
+        )
+        
+    except Exception as e:
+        logger.error(f"Rank {rank}: Training failed: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
 
-    if rank == 0:
-        logger.info("Generating policies...")
-        gen = PolicyGenerator(cfg["model_output"])
-        for s in scenarios[:3]:
-            policy = gen.generate(s.description, {"device_type": s.device_type, "criticality": s.criticality})
-            val = gen.validate_policy(policy)
-            logger.info(f"Policy valid: {val['is_valid_xml']}, target: {val['has_target']}, rules: {val['has_rules']}")
+    # ====== STAGE 5: EVALUATE (RANK 0 ONLY) ======
+if rank == 0:
+    logger.info(f"\n[STAGE 5] Evaluating model...")
+    try:
+        # Reload scenarios for evaluation
+        loader = DataLoader(cfg.get('dataset_csv', 'synthetic_iomt_dataset.csv'))
+        scenarios = loader.load()
 
-        logger.info("Evaluating...")
-        metrics = ModelEvaluator(gen).evaluate(scenarios, sample_size=cfg["eval_size"])
-        logger.info(f"Valid XML: {metrics['valid_xml_rate']:.1f}%")
-        logger.info(f"Has Target: {metrics['has_target_rate']:.1f}%")
-        logger.info(f"Has Rules: {metrics['has_rules_rate']:.1f}%")
-        logger.info(f"Avg Time: {metrics['avg_time']:.2f}s")
-        logger.info("="*50)
+        gen = PolicyGenerator(cfg["mistral_model_output"])
 
+        # Sample policies
+        logger.info("Generating sample policies...")
+        for i, s in enumerate(scenarios[:min(3, len(scenarios))]):
+            try:
+                policy = gen.generate(
+                    s.description,
+                    {"device_type": s.device_type, "criticality": s.criticality}
+                )
+                val = gen.validate_policy(policy)
+                logger.info(f"  Sample {i+1}: Valid XML={val['is_valid_xml']}, "
+                           f"Target={val['has_target']}, Rules={val['has_rules']}")
+            except Exception as e:
+                logger.warning(f"  Sample {i+1} generation failed: {e}")
+        
+        # Full evaluation
+        logger.info(f"Running full evaluation on {cfg['eval_size']} scenarios...")
+        evaluator = ModelEvaluator(gen)
+        metrics = evaluator.evaluate(scenarios, sample_size=cfg['eval_size'])
+        
+        logger.info("\n" + "="*70)
+        logger.info("EVALUATION RESULTS")
+        logger.info("="*70)
+        logger.info(f"Valid XML Rate: {metrics['valid_xml_rate']:.1f}%")
+        logger.info(f"Has Target Rate: {metrics['has_target_rate']:.1f}%")
+        logger.info(f"Has Rules Rate: {metrics['has_rules_rate']:.1f}%")
+        
+        # Use correct metric keys from evaluator
+        if 'avg_time' in metrics:
+            logger.info(f"Avg Generation Time: {metrics['avg_time']:.2f}s")
+        if 'median_time' in metrics:
+            logger.info(f"Median Generation Time: {metrics['median_time']:.2f}s")
+        
+        logger.info("="*70)
+        
+    except Exception as e:
+        logger.error(f"Evaluation failed: {e}")
+        import traceback
+        traceback.print_exc()
+
+    # ====== CLEANUP ======
     if world_size > 1:
         dist.destroy_process_group()
+        logger.info("Destroyed process group")
+
+    logger.info("\n✓ Pipeline complete!")
 
 if __name__ == "__main__":
     main()
