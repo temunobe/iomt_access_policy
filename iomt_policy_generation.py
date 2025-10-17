@@ -2,7 +2,7 @@
 
 import logging
 import os
-import system
+#import system
 import traceback
 import datetime
 import torch
@@ -26,9 +26,7 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 def setup_distributed(timeout_minutes: int = 30):
     """
-    Minimal, torchrun-compatible distributed init.
-    - Uses init_method="env://" so torchrun --standalone works without explicit MASTER_ADDR/PORT handling.
-    - Sets CUDA device from LOCAL_RANK before init so NCCL knows the local GPU mapping.
+    Robust distributed init that works with torchrun, Slurm, or standalone execution.
     Returns: (rank, local_rank, world_size)
     """
     rank = int(os.environ.get("RANK", os.environ.get("SLURM_PROCID", "0")))
@@ -51,9 +49,27 @@ def setup_distributed(timeout_minutes: int = 30):
 
     timeout = datetime.timedelta(minutes=timeout_minutes)
 
-    if not torch.distributed.is_initialized():
-        backend = "nccl" if torch.cuda.is_available() else "gloo"
-        # Use the environment-based init (torchrun --standalone or torchrun launched by Slurm sets the env)
+    # Check if already initialized (can happen in some environments)
+    if torch.distributed.is_initialized():
+        return rank, local_rank, world_size
+
+    # For single-process execution (world_size == 1), skip distributed init
+    if world_size == 1:
+        print(f"[rank {rank}] Single process detected, skipping distributed initialization")
+        return rank, local_rank, world_size
+
+    # Set MASTER_ADDR and MASTER_PORT if not set (for single-node multi-GPU)
+    if "MASTER_ADDR" not in os.environ:
+        os.environ["MASTER_ADDR"] = "localhost"
+        print(f"[rank {rank}] MASTER_ADDR not set, defaulting to localhost")
+    
+    if "MASTER_PORT" not in os.environ:
+        os.environ["MASTER_PORT"] = "29500"
+        print(f"[rank {rank}] MASTER_PORT not set, defaulting to 29500")
+
+    backend = "nccl" if torch.cuda.is_available() else "gloo"
+    
+    try:
         torch.distributed.init_process_group(
             backend=backend,
             init_method="env://",
@@ -61,6 +77,11 @@ def setup_distributed(timeout_minutes: int = 30):
             rank=rank,
             timeout=timeout,
         )
+        print(f"[rank {rank}] Successfully initialized distributed process group with {backend}")
+    except Exception as e:
+        print(f"[rank {rank}] Failed to initialize distributed: {e}")
+        # Fall back to non-distributed mode
+        return rank, local_rank, 1
 
     return rank, local_rank, world_size
 
@@ -78,37 +99,63 @@ def main():
         logger.info(f"World size: {world_size}")
         logger.info(f"Config: {cfg}")
     
+    # Load and format data on rank 0, then broadcast or save/load
     if rank == 0:
         logger.info("1/5 LOADING DATASET")
-    scenarios = None
-    if rank == 0:
         loader = DataLoader(cfg["dataset_csv"])
         scenarios = loader.load()
-    
-    # Broadcast scenarios to all ranks (simplified - in production use proper serialization)
-    if world_size > 1:
-        torch.distributed.barrier()
-    
-    if rank == 0:
+        
         logger.info("2/5 FORMATTING DATA")
-    formatter = DataFormatter(cfg["model_name"])
-    if rank == 0:
+        formatter = DataFormatter(cfg["model_name"])
         dataset = formatter.format_and_split(scenarios)
-    else:
-        # Other ranks wait
-        dataset = None
-    
-    if rank == 0:
+        
         tokenized_dataset = formatter.prepare_tokenized_dataset(
             dataset, 
             max_seq_length=4096,
             num_proc=1
         )
+        
+        # Save tokenized dataset to disk for other ranks to load
+        if world_size > 1:
+            import tempfile
+            temp_dir = tempfile.mkdtemp(prefix="iomt_dataset_")
+            tokenized_dataset.save_to_disk(temp_dir)
+            dataset_path = temp_dir
+            logger.info(f"Saved tokenized dataset to {dataset_path}")
+        else:
+            dataset_path = None
     else:
+        scenarios = None
         tokenized_dataset = None
+        dataset_path = None
     
+    # Broadcast dataset path to all ranks
     if world_size > 1:
-        torch.distributed.barrier()
+        import torch.distributed as dist
+        
+        # Rank 0 broadcasts the path length and then the path
+        if rank == 0:
+            path_bytes = dataset_path.encode('utf-8')
+            path_len = torch.tensor([len(path_bytes)], dtype=torch.long).cuda()
+        else:
+            path_len = torch.tensor([0], dtype=torch.long).cuda()
+        
+        dist.broadcast(path_len, src=0)
+        
+        if rank == 0:
+            path_tensor = torch.tensor(list(path_bytes), dtype=torch.uint8).cuda()
+        else:
+            path_tensor = torch.zeros(path_len.item(), dtype=torch.uint8).cuda()
+        
+        dist.broadcast(path_tensor, src=0)
+        
+        if rank != 0:
+            dataset_path = bytes(path_tensor.cpu().numpy()).decode('utf-8')
+            from datasets import load_from_disk
+            tokenized_dataset = load_from_disk(dataset_path)
+            logger.info(f"[rank {rank}] Loaded tokenized dataset from {dataset_path}")
+        
+        dist.barrier()
     
     if rank == 0:
         logger.info("3/5 TRAINING MODEL")
@@ -116,16 +163,18 @@ def main():
     trainer_obj = ModelTrainer(cfg["model_name"], cfg["model_output"])
     trainer_obj.load_model()
     
+    # All ranks participate in training
+    trainer_obj.train(
+        tokenized_dataset["train"] if tokenized_dataset else None,
+        tokenized_dataset["validation"] if tokenized_dataset else None,
+        num_epochs=cfg["epochs"],
+        learning_rate=cfg["learning_rate"],
+        batch_size=cfg["batch_size"],
+        grad_accum=cfg["grad_accumulation"]
+    )
+    
+    # Only rank 0 does policy generation and evaluation
     if rank == 0:
-        trainer_obj.train(
-            tokenized_dataset["train"],
-            tokenized_dataset["validation"],
-            num_epochs=cfg["epochs"],
-            learning_rate=cfg["learning_rate"],
-            batch_size=cfg["batch_size"],
-            grad_accum=cfg["grad_accumulation"]
-        )
-        
         logger.info("4/5 GENERATING SAMPLE POLICIES")
         generator = PolicyGenerator(cfg["model_output"])
         for scenario in scenarios[:3]:
@@ -150,16 +199,11 @@ def main():
         logger.info(f"Training epochs: {cfg['epochs']}")
         logger.info(f"Evaluation metrics: {metrics}")
         logger.info("="*60)
-    else:
-        # Other ranks participate in training but don't generate policies
-        trainer_obj.train(
-            None,  # These will be loaded by distributed data loading
-            None,
-            num_epochs=cfg["epochs"],
-            learning_rate=cfg["learning_rate"],
-            batch_size=cfg["batch_size"],
-            grad_accum=cfg["grad_accumulation"]
-        )
+        
+        # Cleanup temporary dataset directory
+        if world_size > 1 and dataset_path:
+            import shutil
+            shutil.rmtree(dataset_path)
     
     if world_size > 1:
         torch.distributed.destroy_process_group()
