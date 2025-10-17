@@ -2,3 +2,6 @@
 iomtenv/
 
 config.py
+mistral7b_model/
+llama4_model/
+__pycache__/
