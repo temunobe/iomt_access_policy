@@ -49,7 +49,7 @@ class ModelTrainer:
             return {"count": gpu_count, "name": gpu_name, "memory_gb": gpu_memory}
         return {"count": 0, "name": "CPU", "memory_gb": 0}
 
-    def _safe_from_pretrained(self, **kwargs):
+    def _safe_from_pretrained(self, *args, **kwargs):
         """Call AutoModelForCausalLM.from_pretrained but gracefully handle
         models that don't support Flash Attention 2.0 by retrying without
         the attn_implementation kwarg.
@@ -59,14 +59,14 @@ class ModelTrainer:
         backend.
         """
         try:
-            return AutoModelForCausalLM.from_pretrained(**kwargs)
+            return AutoModelForCausalLM.from_pretrained(*args, **kwargs)
         except ValueError as e:
             msg = str(e)
             # Detect the specific Flash Attention 2.0 complaint and retry
             if "Flash Attention 2.0" in msg or "flash_attention_2" in msg or "flash attention" in msg.lower():
                 logger.warning("Model class does not support Flash Attention 2.0; retrying without attn_implementation...")
                 kwargs.pop("attn_implementation", None)
-                return AutoModelForCausalLM.from_pretrained(**kwargs)
+                return AutoModelForCausalLM.from_pretrained(*args, **kwargs)
             # Re-raise if it's some other ValueError
             raise
 

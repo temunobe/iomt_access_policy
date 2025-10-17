@@ -171,9 +171,9 @@ def main():
         tokenized_dataset["train"] if tokenized_dataset else None,
         tokenized_dataset["validation"] if tokenized_dataset else None,
         num_epochs=cfg["epochs"],
-        learning_rate=cfg["learning_rate"],
-        batch_size=cfg["batch_size"],
-        grad_accum=cfg["grad_accumulation"]
+        learning_rate=cfg["lr"],
+        batch_size=cfg["batch"],
+        grad_accum=cfg["grad_accum"]
     )
     
     # Only rank 0 does policy generation and evaluation
