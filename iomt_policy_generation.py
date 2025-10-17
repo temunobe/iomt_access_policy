@@ -23,6 +23,9 @@ logger = logging.getLogger(__name__)
 
 os.environ["TOKENIZERS_PARALLELISM"] = 'true'
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+# New name for this config was introduced in newer PyTorch; set both so older/newer runtimes behave the same.
+if "PYTORCH_ALLOC_CONF" not in os.environ:
+    os.environ["PYTORCH_ALLOC_CONF"] = os.environ["PYTORCH_CUDA_ALLOC_CONF"]
 
 def setup_distributed(timeout_minutes: int = 30):
     """

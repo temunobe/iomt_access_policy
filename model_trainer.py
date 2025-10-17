@@ -49,6 +49,27 @@ class ModelTrainer:
             return {"count": gpu_count, "name": gpu_name, "memory_gb": gpu_memory}
         return {"count": 0, "name": "CPU", "memory_gb": 0}
 
+    def _safe_from_pretrained(self, **kwargs):
+        """Call AutoModelForCausalLM.from_pretrained but gracefully handle
+        models that don't support Flash Attention 2.0 by retrying without
+        the attn_implementation kwarg.
+
+        This avoids the exception raised by some model class implementations
+        in Transformers which haven't added support for the newer attn
+        backend.
+        """
+        try:
+            return AutoModelForCausalLM.from_pretrained(**kwargs)
+        except ValueError as e:
+            msg = str(e)
+            # Detect the specific Flash Attention 2.0 complaint and retry
+            if "Flash Attention 2.0" in msg or "flash_attention_2" in msg or "flash attention" in msg.lower():
+                logger.warning("Model class does not support Flash Attention 2.0; retrying without attn_implementation...")
+                kwargs.pop("attn_implementation", None)
+                return AutoModelForCausalLM.from_pretrained(**kwargs)
+            # Re-raise if it's some other ValueError
+            raise
+
     def _apply_qlora(self):
         logger.info("Applying QLoRA adapters...")
         lora_config = LoraConfig(
@@ -83,7 +104,7 @@ class ModelTrainer:
         if bnb_config is not None:
             try:
                 logger.info("Loading model with 4-bit quantization (BitsAndBytes)...")
-                self.model = AutoModelForCausalLM.from_pretrained(
+                self.model = self._safe_from_pretrained(
                     self.model_name,
                     quantization_config=bnb_config,
                     device_map="auto",
@@ -102,7 +123,7 @@ class ModelTrainer:
 
         logger.info("Loading model without quantization.")
         dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
-        self.model = AutoModelForCausalLM.from_pretrained(
+        self.model = self._safe_from_pretrained(
             self.model_name,
             device_map="auto" if torch.cuda.is_available() else None,
             trust_remote_code=True,
