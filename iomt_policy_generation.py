@@ -67,7 +67,7 @@ def main():
     if rank == 0:
         logger.info("\n[STAGE 1] Loading dataset...")
         try:
-            loader = DataLoader(config.get('data_dir', 'synthetic_iomt_dataset.csv'))
+            loader = DataLoader(config.get('data_dir', 'clinical_access_control_scenarios.csv'))
             scenarios = loader.load()
             logger.info(f"✓ Loaded {len(scenarios)} scenarios")
         except Exception as e:
@@ -152,53 +152,41 @@ def main():
         raise
 
     # ====== STAGE 5: EVALUATE (RANK 0 ONLY) ======
-if rank == 0:
-    logger.info(f"\n[STAGE 5] Evaluating model...")
-    try:
-        # Reload scenarios for evaluation
-        loader = DataLoader(cfg.get('dataset_csv', 'synthetic_iomt_dataset.csv'))
-        scenarios = loader.load()
+    if rank == 0:
+        logger.info(f"\n[STAGE 5] Evaluating model...")
+        try:
+            # Reload scenarios for evaluation
+            loader = DataLoader(cfg.get('dataset_csv', 'synthetic_iomt_dataset.csv'))
+            scenarios = loader.load()
 
-        gen = PolicyGenerator(cfg["mistral_model_output"])
+            gen = PolicyGenerator(cfg["mistral_model_output"])
 
-        # Sample policies
-        logger.info("Generating sample policies...")
-        for i, s in enumerate(scenarios[:min(3, len(scenarios))]):
-            try:
-                policy = gen.generate(
-                    s.description,
-                    {"device_type": s.device_type, "criticality": s.criticality}
-                )
-                val = gen.validate_policy(policy)
-                logger.info(f"  Sample {i+1}: Valid XML={val['is_valid_xml']}, "
-                           f"Target={val['has_target']}, Rules={val['has_rules']}")
-            except Exception as e:
-                logger.warning(f"  Sample {i+1} generation failed: {e}")
-        
-        # Full evaluation
-        logger.info(f"Running full evaluation on {cfg['eval_size']} scenarios...")
-        evaluator = ModelEvaluator(gen)
-        metrics = evaluator.evaluate(scenarios, sample_size=cfg['eval_size'])
-        
-        logger.info("\n" + "="*70)
-        logger.info("EVALUATION RESULTS")
-        logger.info("="*70)
-        logger.info(f"Valid XML Rate: {metrics['valid_xml_rate']:.1f}%")
-        logger.info(f"Has Target Rate: {metrics['has_target_rate']:.1f}%")
-        logger.info(f"Has Rules Rate: {metrics['has_rules_rate']:.1f}%")
-        
-        # Use correct metric keys from evaluator
-        if 'avg_time' in metrics:
-            logger.info(f"Avg Generation Time: {metrics['avg_time']:.2f}s")
-        if 'median_time' in metrics:
-            logger.info(f"Median Generation Time: {metrics['median_time']:.2f}s")
-        
-        logger.info("="*70)
-        
-    except Exception as e:
-        logger.error(f"Evaluation failed: {e}")
-        import traceback
-        traceback.print_exc()
+            # Sample policies
+            logger.info("Generating sample policies...")
+            for i, s in enumerate(scenarios[:min(3, len(scenarios))]):
+                try:
+                    policy = gen.generate(
+                        s.description,
+                        {"device_type": s.device_type, "criticality": s.criticality}
+                    )
+                    val = gen.validate_policy(policy)
+                    logger.info(f"  Sample {i+1}: Valid XML={val['is_valid_xml']}, "
+                            f"Target={val['has_target']}, Rules={val['has_rules']}")
+                except Exception as e:
+                    logger.warning(f"  Sample {i+1} generation failed: {e}")
+            
+            # Full evaluation with comprehensive metrics
+            logger.info(f"Running full evaluation on {cfg['eval_size']} scenarios...")
+            evaluator = ModelEvaluator(gen)
+            metrics = evaluator.evaluate(scenarios, sample_size=cfg['eval_size'])
+            
+            # Print detailed report
+            evaluator.print_detailed_report(metrics)
+            
+        except Exception as e:
+            logger.error(f"Evaluation failed: {e}")
+            import traceback
+            traceback.print_exc()
 
     # ====== CLEANUP ======
     if world_size > 1:

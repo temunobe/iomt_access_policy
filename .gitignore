@@ -4,4 +4,5 @@ iomtenv/
 config.py
 mistral7b_model/
 llama4_model/
+tokenized_dataset_cache/
 __pycache__/
