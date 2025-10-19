@@ -1,280 +1,227 @@
-# model_trainer.py
+#!/usr/bin/env python3
+# model_trainer.py - Llama 4 Scout 17B 16E - FIXED for MoE architecture
 
 import os
 import logging
 import torch
-import gc
-from transformers import (
-    AutoTokenizer,
-    AutoModelForCausalLM,
-    TrainingArguments,
-    Trainer,
-    BitsAndBytesConfig,
-    DataCollatorForLanguageModeling
-)
+from transformers import (AutoTokenizer, AutoModelForCausalLM, TrainingArguments, Trainer,
+                          BitsAndBytesConfig, DataCollatorForLanguageModeling)
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+import importlib
+from config import cfg
 
 logger = logging.getLogger(__name__)
 
 class ModelTrainer:
-    """Train Llama with distributed multi-GPU support"""
-
-    def __init__(self, model_name: str = "meta-llama/Llama-4-Scout-17B-16E-Instruct", output_dir: str = "./llama4_iomt_model"):
+    def __init__(self, model_name: str = "meta-llama/Llama-4-Scout-17B-16E", output_dir: str = "/home/bsindala/projects/llama4_finetuned_model"):
         self.model_name = model_name
         self.output_dir = output_dir
-        self.gpu_specs = self._detect_gpu_specs()
-        logger.info(f"GPU Config: {self.gpu_specs}")
-        
-        # Get distributed training info
         self.rank = int(os.environ.get("RANK", 0))
         self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
         self.world_size = int(os.environ.get("WORLD_SIZE", 1))
-        
-        logger.info(f"Trainer initialized - rank={self.rank}, local_rank={self.local_rank}, world_size={self.world_size}")
-        
-        # CRITICAL: Clear GPU cache before loading anything
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            gc.collect()
+        self.hf_token = cfg['hf_token'] if 'hf_token' in cfg else None
 
-        # Load tokenizer
-        if os.path.exists(model_name):
-            self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, local_files_only=True)
-        else:
-            self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-        
+        local = os.path.exists(model_name)
+        tokenizer_kwargs = {"trust_remote_code": True, "local_files_only": local}
+        if self.hf_token:
+            tokenizer_kwargs["token"] = self.hf_token
+
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, **tokenizer_kwargs)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+        
         self.model = None
+        self.quantized = False
 
-    def _detect_gpu_specs(self):
+    def _bnb_importable(self) -> bool:
+        try:
+            importlib.import_module("bitsandbytes")
+            return True
+        except Exception:
+            return False
+
+    def load_model(self):
+        logger.info(f"Loading Llama 4 Scout 17B 16E from {self.model_name}")
+        logger.info("NOTE: Gradient checkpointing DISABLED due to MoE architecture incompatibility")
+
         if torch.cuda.is_available():
-            gpu_count = torch.cuda.device_count()
-            gpu_name = torch.cuda.get_device_name(0)
-            gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1e9
-            
-            # Log memory usage
-            for i in range(gpu_count):
-                allocated = torch.cuda.memory_allocated(i) / 1e9
-                reserved = torch.cuda.memory_reserved(i) / 1e9
-                logger.info(f"GPU {i} - Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB")
-            
-            return {"count": gpu_count, "name": gpu_name, "memory_gb": gpu_memory}
-        return {"count": 0, "name": "CPU", "memory_gb": 0}
+            torch.cuda.empty_cache()
 
-    def _apply_qlora(self):
-        logger.info("Applying QLoRA adapters...")
-        lora_config = LoraConfig(
-            r=64,
-            lora_alpha=32,
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        local = os.path.exists(self.model_name)
+        
+        # Use device_map="auto" for automatic sharding
+        device_map = "auto"
+        logger.info(f"Using device_map='auto' - model will be sharded across {torch.cuda.device_count()} GPUs")
+
+        hf_kwargs = {
+            "trust_remote_code": True, 
+            "local_files_only": local, 
+            "low_cpu_mem_usage": True,
+            "use_cache": False,  # Required for training
+        }
+        if self.hf_token:
+            hf_kwargs["token"] = self.hf_token
+
+        # Try 4-bit quantization (REQUIRED for MoE models with limited memory)
+        if self._bnb_importable():
+            try:
+                logger.info("Loading with 4-bit quantization (REQUIRED for Llama 4 Scout MoE)...")
+                bnb_cfg = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_compute_dtype=torch.bfloat16,
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_quant_storage=torch.bfloat16,
+                )
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    self.model_name,
+                    quantization_config=bnb_cfg,
+                    device_map=device_map,
+                    torch_dtype=torch.bfloat16,
+                    **hf_kwargs
+                )
+                
+                # Prepare for k-bit training WITHOUT gradient checkpointing
+                self.model = prepare_model_for_kbit_training(
+                    self.model, 
+                    use_gradient_checkpointing=False  # CRITICAL: Disabled for MoE
+                )
+                self.quantized = True
+                logger.info("✓ Model loaded with 4-bit quantization")
+                
+            except Exception as e:
+                logger.error(f"4-bit loading failed: {e}")
+                logger.error("Llama 4 Scout 17B MoE requires quantization to fit in memory")
+                raise RuntimeError("4-bit quantization required but failed. Please ensure bitsandbytes is properly installed.")
+        else:
+            logger.error("bitsandbytes not available!")
+            logger.error("Llama 4 Scout 17B MoE (16 experts) is too large without quantization")
+            raise RuntimeError("4-bit quantization required. Please install: pip install bitsandbytes")
+
+        # Apply LoRA after quantization
+        self.model = self._apply_lora()
+        logger.info("✓ LoRA applied")
+        
+        # Verify trainable params exist
+        trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        if trainable == 0:
+            raise RuntimeError("ERROR: No trainable parameters after LoRA! Training cannot proceed.")
+        
+        # Ensure model is in training mode
+        self.model.train()
+        
+        # Disable any internal gradient checkpointing that may have been set
+        if hasattr(self.model, 'gradient_checkpointing_disable'):
+            self.model.gradient_checkpointing_disable()
+
+    def _apply_lora(self):
+        """Apply LoRA adapters for Llama 4 Scout MoE"""
+        # For MoE models, be selective with target modules to avoid memory issues
+        # Focus on attention layers, not all expert layers
+        cfg = LoraConfig(
+            r=8,
+            lora_alpha=16,
+            # Only target attention projections, not MoE experts
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
             lora_dropout=0.05,
             bias="none",
             task_type="CAUSAL_LM",
-            use_rslora=True,
+            modules_to_save=None,
         )
-        model = get_peft_model(self.model, lora_config)
+        
+        try:
+            model = get_peft_model(self.model, cfg)
+        except Exception as e:
+            logger.error(f"Failed to apply LoRA: {e}")
+            raise
+        
+        # Log trainable params
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
         total = sum(p.numel() for p in model.parameters())
-        logger.info(f"Trainable: {trainable:,} ({100 * trainable / total:.2f}%)")
+        logger.info(f"Trainable params: {trainable:,} / {total:,} ({trainable/total*100:.2f}%)")
+        
         return model
 
-    def load_model(self):
-        logger.info(f"Loading model: {self.model_name}")
+    def train(self, train_ds, val_ds, num_epochs=3, lr=1e-5, batch_size=1, grad_accum=16):
+        """Train Llama 4 Scout WITHOUT gradient checkpointing"""
         
-        # Aggressive memory cleanup before loading
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-            gc.collect()
-            logger.info("Cleared CUDA cache before model loading")
+        eval_strategy = "steps" if val_ds is not None else "no"
+        eval_steps = 50 if val_ds is not None else None
+        logging_steps = 10
 
-        # SOLUTION 1: Use 4-bit with CPU offloading to manage memory
-        bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.float16,  # Use fp16 instead of bf16
-            bnb_4bit_use_double_quant=True,
-        )
-
-        try:
-            logger.info("Loading model with 4-bit quantization...")
-            
-            # SOLUTION 2: Calculate safe max_memory (leave 10GB buffer)
-            if self.gpu_specs['count'] > 0:
-                safe_memory_gb = max(10, self.gpu_specs['memory_gb'] - 10)
-                max_memory_config = {i: f"{safe_memory_gb}GB" for i in range(self.gpu_specs['count'])}
-                # Add CPU offload
-                max_memory_config["cpu"] = "50GB"
-            else:
-                max_memory_config = None
-            
-            logger.info(f"Memory config: {max_memory_config}")
-            
-            self.model = AutoModelForCausalLM.from_pretrained(
-                self.model_name,
-                quantization_config=bnb_config,
-                device_map="auto",
-                trust_remote_code=True,
-                torch_dtype=torch.float16,  # Consistent with quantization
-                local_files_only=os.path.exists(self.model_name),
-                low_cpu_mem_usage=True,
-                max_memory=max_memory_config,
-                # SOLUTION 3: Offload some layers to CPU if needed
-                offload_folder="./offload_tmp",
-                offload_state_dict=True,
-            )
-            
-            logger.info("Model loaded, preparing for k-bit training...")
-            
-            # SOLUTION 4: Don't call prepare_model_for_kbit_training if model is already quantized
-            # The model is already prepared when loaded with quantization_config
-            # Just apply LoRA directly
-            
-            # FIX: Llama 4 MoE doesn't support gradient checkpointing with the router
-            # We'll handle this in TrainingArguments instead
-            # self.model.gradient_checkpointing_enable()  # REMOVED - causes router unpacking error
-            self.model = self._apply_qlora()
-            
-            logger.info("✓ Model loaded with QLoRA (4-bit)")
-            
-            # Log final memory usage
-            if torch.cuda.is_available():
-                for i in range(self.gpu_specs['count']):
-                    allocated = torch.cuda.memory_allocated(i) / 1e9
-                    reserved = torch.cuda.memory_reserved(i) / 1e9
-                    logger.info(f"GPU {i} after load - Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB")
-            
-            return self.model
-            
-        except torch.cuda.OutOfMemoryError as e:
-            logger.error(f"OOM Error during quantized load: {e}")
-            logger.info("Attempting recovery: clearing cache and retrying with more aggressive offloading")
-            
-            # Emergency cleanup
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
-            gc.collect()
-            
-            try:
-                # SOLUTION 5: More aggressive CPU offloading
-                max_memory_config = {}
-                if self.gpu_specs['count'] > 0:
-                    # Use only 60% of GPU memory
-                    conservative_memory = int(self.gpu_specs['memory_gb'] * 0.6)
-                    max_memory_config = {i: f"{conservative_memory}GB" for i in range(self.gpu_specs['count'])}
-                max_memory_config["cpu"] = "100GB"
-                
-                logger.info(f"Retry with conservative memory config: {max_memory_config}")
-                
-                self.model = AutoModelForCausalLM.from_pretrained(
-                    self.model_name,
-                    quantization_config=bnb_config,
-                    device_map="balanced",  # Try balanced instead of auto
-                    trust_remote_code=True,
-                    torch_dtype=torch.float16,
-                    local_files_only=os.path.exists(self.model_name),
-                    low_cpu_mem_usage=True,
-                    max_memory=max_memory_config,
-                    offload_folder="./offload_tmp",
-                    offload_state_dict=True,
-                )
-                
-                self.model.gradient_checkpointing_enable()
-                self.model = self._apply_qlora()
-                logger.info("✓ Model loaded with conservative settings")
-                return self.model
-                
-            except Exception as e2:
-                logger.error(f"Failed even with conservative settings: {e2}")
-                raise RuntimeError(
-                    "Cannot load model even with aggressive CPU offloading. "
-                    "Suggestions:\n"
-                    "1. Kill other GPU processes: nvidia-smi to identify, kill -9 <PID>\n"
-                    "2. Use multiple GPUs with model parallelism\n"
-                    "3. Use a smaller model or reduce LoRA rank\n"
-                    "4. Try running on CPU (very slow): device_map='cpu'"
-                ) from e2
-
-    def train(self, train_dataset, eval_dataset, num_epochs=1, learning_rate=1e-5, batch_size=1, grad_accum=16):
-        logger.info("STARTING DISTRIBUTED TRAINING")
+        # Very conservative settings for MoE
+        effective_batch = batch_size
+        grad_accum = max(grad_accum, 32)  # Increase to compensate for no checkpointing
         
-        # Clear cache before training
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            gc.collect()
-        
-        training_args = TrainingArguments(
+        logger.info(f"Effective batch size: {effective_batch * grad_accum}")
+        logger.info(f"Per-device batch: {effective_batch}, Gradient accumulation: {grad_accum}")
+        logger.info("WARNING: Gradient checkpointing DISABLED for MoE stability")
+
+        args = TrainingArguments(
             output_dir=self.output_dir,
             num_train_epochs=num_epochs,
-            per_device_train_batch_size=batch_size,
+            per_device_train_batch_size=effective_batch,
             per_device_eval_batch_size=1,
             gradient_accumulation_steps=grad_accum,
-            gradient_checkpointing=True,  # Enable to save memory during training
-            gradient_checkpointing_kwargs={"use_reentrant": False},
-            learning_rate=learning_rate,
+            gradient_checkpointing=False,  # CRITICAL: Disabled for MoE
+            learning_rate=lr,
             weight_decay=0.01,
             warmup_ratio=0.05,
-            lr_scheduler_type="cosine_with_restarts",
-            optim="adamw_torch_fused" if torch.cuda.is_available() else "adamw_torch",
-            fp16=torch.cuda.is_available(),
-            bf16=False,
-            logging_steps=10,
-            eval_strategy="steps",
-            eval_steps=100,
-            save_strategy="steps",
-            save_steps=200,
-            save_total_limit=2,
-            load_best_model_at_end=True,
-            dataloader_num_workers=2,
-            dataloader_pin_memory=True,
-            report_to=[],
-            max_grad_norm=1.0,
-            remove_unused_columns=False,
-            ddp_find_unused_parameters=False,
-            ddp_backend="nccl" if torch.cuda.is_available() else "gloo",
-            local_rank=self.local_rank,
-            ddp_timeout=3600,
-            # SOLUTION 6: More aggressive memory management during training
-            max_steps=-1,
+            lr_scheduler_type="cosine",
+            optim="adamw_bnb_8bit" if self.quantized else "adamw_torch",
+            bf16=True,
+            bf16_full_eval=True,
+            logging_steps=logging_steps,
             logging_first_step=True,
-            # Enable these to reduce memory usage
-            eval_accumulation_steps=4,
-            save_safetensors=True,
+            eval_strategy=eval_strategy,
+            eval_steps=eval_steps if eval_steps is not None else 0,
+            save_strategy="steps" if val_ds is not None else "no",
+            save_steps=200 if val_ds is not None else None,
+            save_total_limit=2,
+            load_best_model_at_end=True if val_ds is not None else False,
+            max_grad_norm=0.3,  # Lower for stability
+            remove_unused_columns=False,
+            dataloader_pin_memory=False,
+            dataloader_num_workers=0,
+            ddp_find_unused_parameters=False,
+            report_to="none",  # Disable wandb/tensorboard for stability
+            # Memory optimizations
+            max_steps=-1,  # Train for full epochs
+            eval_accumulation_steps=1,
         )
 
-        data_collator = DataCollatorForLanguageModeling(tokenizer=self.tokenizer, mlm=False)
+        # Custom data collator with proper padding
+        data_collator = DataCollatorForLanguageModeling(
+            self.tokenizer, 
+            mlm=False,
+            pad_to_multiple_of=8  # Efficient for GPU
+        )
 
         trainer = Trainer(
             model=self.model,
-            args=training_args,
-            train_dataset=train_dataset,
-            eval_dataset=eval_dataset,
-            tokenizer=self.tokenizer,
-            data_collator=data_collator
+            args=args,
+            train_dataset=train_ds,
+            eval_dataset=val_ds,
+            data_collator=data_collator,
         )
 
+        logger.info("Starting training with Llama 4 Scout 17B 16E MoE...")
+        logger.info(f"Training on {len(train_ds)} samples")
+        
         try:
             trainer.train()
-        except torch.cuda.OutOfMemoryError as e:
-            logger.error(f"OOM during training: {e}")
-            logger.error("Try reducing batch_size to 1 and grad_accum to 4")
+            logger.info("✓ Training completed successfully")
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                logger.error("OOM Error! Try:")
+                logger.error("  1. Reduce max_seq_length in tokenization")
+                logger.error("  2. Increase gradient_accumulation_steps")
+                logger.error("  3. Use fewer samples for training")
             raise
-        except Exception as e:
-            logger.error("Training failed with exception: %s", e)
-            if "CUDA error" in str(e) or "cuda" in str(e).lower():
-                logger.error("CUDA error detected. Debug steps:\n"
-                             " 1) CUDA_LAUNCH_BLOCKING=1 python iomt_policy_generation.py\n"
-                             " 2) Check nvidia-smi for other processes using GPU memory\n"
-                             " 3) Reduce batch size and gradient accumulation\n"
-                             " 4) Use fewer GPUs or single GPU mode")
-            raise
-        
-        # Save only on rank 0
-        if self.rank == 0:
-            trainer.save_model(self.output_dir)
-            self.tokenizer.save_pretrained(self.output_dir)
-            logger.info(f"✓ Training complete, model saved to {self.output_dir}")
-        
-        return trainer
+
+        # Save model
+        logger.info("Saving model...")
+        trainer.save_model(self.output_dir)
+        self.tokenizer.save_pretrained(self.output_dir)
+        logger.info(f"✓ Model saved to {self.output_dir}")

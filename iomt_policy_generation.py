@@ -1,265 +1,169 @@
-# iomt_policy_generation.py
+#!/usr/bin/env python3
+# iomt_policy_generation.py - Llama 4 Scout 17B 16E VERSION
 
-import logging
 import os
-#import system
-import traceback
+import logging
 import datetime
 import torch
-import subprocess
+import torch.distributed as dist
 from data_loader import DataLoader
 from data_formatter import DataFormatter
 from model_trainer import ModelTrainer
 from policy_generator import PolicyGenerator
 from evaluator import ModelEvaluator
 from config import cfg
-import torch.distributed as dist
+from datasets import load_from_disk
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 os.environ["TOKENIZERS_PARALLELISM"] = 'true'
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-# New name for this config was introduced in newer PyTorch; set both so older/newer runtimes behave the same.
-if "PYTORCH_ALLOC_CONF" not in os.environ:
-    os.environ["PYTORCH_ALLOC_CONF"] = os.environ["PYTORCH_CUDA_ALLOC_CONF"]
 
-def setup_distributed(timeout_minutes: int = 30):
-    """
-    Robust distributed init that works with torchrun, Slurm, or standalone execution.
-    Returns: (rank, local_rank, world_size)
-    """
-    rank = int(os.environ.get("RANK", os.environ.get("SLURM_PROCID", "0")))
-    local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("SLURM_LOCALID", "0")))
-    world_size = int(os.environ.get("WORLD_SIZE", os.environ.get("SLURM_NTASKS", "1")))
+def setup_distributed(timeout_min=30):
+    rank = int(os.environ.get("RANK", 0))
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
 
-    # If distributed support isn't available, return early.
-    if not torch.distributed.is_available():
+    if not dist.is_available() or world_size == 1:
         return rank, local_rank, world_size
 
-    # Set CUDA device early so NCCL picks the right local device.
     if torch.cuda.is_available():
-        ngpus = torch.cuda.device_count()
-        device_id = local_rank % max(1, ngpus)
-        try:
-            torch.cuda.set_device(device_id)
-            print(f"[rank {rank}] set CUDA device to {device_id}")
-        except Exception as e:
-            print(f"[rank {rank}] warning: failed to set CUDA device {device_id}: {e}")
+        ngpu = torch.cuda.device_count()
+        torch.cuda.set_device(local_rank % max(1, ngpu))
 
-    timeout = datetime.timedelta(minutes=timeout_minutes)
-
-    # Check if already initialized (can happen in some environments)
-    if torch.distributed.is_initialized():
-        return rank, local_rank, world_size
-
-    # Set MASTER_ADDR and MASTER_PORT if not set (for single-node multi-GPU)
-    if "MASTER_ADDR" not in os.environ:
-        os.environ["MASTER_ADDR"] = "localhost"
-        print(f"[rank {rank}] MASTER_ADDR not set, defaulting to localhost")
-    
-    if "MASTER_PORT" not in os.environ:
-        os.environ["MASTER_PORT"] = "29500"
-        print(f"[rank {rank}] MASTER_PORT not set, defaulting to 29500")
-
-    backend = "nccl" if torch.cuda.is_available() else "gloo"
-    
-    # If single-process, try to create a local process group so libraries
-    # that expect a default group (accelerate/transformers) won't fail.
-    if world_size == 1:
-        try:
-            torch.distributed.init_process_group(
-                backend=backend,
-                init_method="env://",
-                world_size=1,
-                rank=rank,
-                timeout=timeout,
-            )
-            print(f"[rank {rank}] Initialized single-process distributed group with {backend}")
-            return rank, local_rank, world_size
-        except Exception as e:
-            print(f"[rank {rank}] env:// single-process init failed: {e}; trying file-based init")
-            # Try a file-based init as a last resort for single-node single-process
-            try:
-                import tempfile
-                tmpf = tempfile.mktemp()
-                file_url = f"file://{tmpf}"
-                torch.distributed.init_process_group(
-                    backend=backend,
-                    init_method=file_url,
-                    world_size=1,
-                    rank=rank,
-                    timeout=timeout,
-                )
-                print(f"[rank {rank}] Initialized single-process distributed group with file:// init and {backend}")
-                return rank, local_rank, world_size
-            except Exception as e2:
-                print(f"[rank {rank}] file:// single-process init failed: {e2}; continuing without process group")
-
-    try:
-        torch.distributed.init_process_group(
-            backend=backend,
-            init_method="env://",
-            world_size=world_size,
-            rank=rank,
-            timeout=timeout,
+    if not dist.is_initialized():
+        dist.init_process_group(
+            backend="nccl" if torch.cuda.is_available() else "gloo",
+            init_method="env://", 
+            timeout=datetime.timedelta(minutes=timeout_min)
         )
-        print(f"[rank {rank}] Successfully initialized distributed process group with {backend}")
-    except Exception as e:
-        print(f"[rank {rank}] Failed to initialize distributed: {e}")
-        # Fall back to non-distributed mode
-        return rank, local_rank, 1
-
     return rank, local_rank, world_size
 
 def main():
-    rank, local_rank, world_size = setup_distributed()
+    # For multi-GPU with device_map="auto", run as single process
+    # Don't use torchrun or distributed launch
     
-    # Only rank 0 logs fully
-    if rank != 0:
-        logging.getLogger().setLevel(logging.WARNING)
-    
-    if rank == 0:
-        logger.info("="*60)
-        logger.info("IOMT Access Policy Generation - Distributed Training")
-        logger.info("="*60)
-        logger.info(f"World size: {world_size}")
-        logger.info(f"Config: {cfg}")
-    
-    # Load and format data on rank 0, then broadcast or save/load
-    if rank == 0:
-        logger.info("1/5 LOADING DATASET")
-        loader = DataLoader(cfg["dataset_csv"])
+    rank = 0  # Single process mode
+    local_rank = 0
+    world_size = 1
+
+    logger.info("="*70)
+    logger.info("IOMT Policy Generation Pipeline - Llama 4 Scout 17B 16E")
+    logger.info(f"Running in single-process mode with device_map='auto'")
+    logger.info(f"Available GPUs: {torch.cuda.device_count()}")
+    logger.info("="*70)
+
+    # ====== STAGE 1: LOAD DATA ======
+    scenarios = None
+    logger.info("\n[STAGE 1] Loading dataset...")
+    try:
+        loader = DataLoader(cfg.get('data_dir', 'clinical_access_control_scenarios.csv'))
         scenarios = loader.load()
-        
-        logger.info("2/5 FORMATTING DATA")
+        logger.info(f"✓ Loaded {len(scenarios)} scenarios")
+    except Exception as e:
+        logger.error(f"Failed to load dataset: {e}")
+        raise
+
+    # ====== STAGE 2: FORMAT AND TOKENIZE ======
+    logger.info("\n[STAGE 2] Formatting and tokenizing data...")
+    try:
         formatter = DataFormatter(cfg["model_name"])
-        dataset = formatter.format_and_split(scenarios)
+        logger.info("✓ Tokenizer loaded")
         
-        tokenized_dataset = formatter.prepare_tokenized_dataset(
-            dataset, 
-            max_seq_length=4096,
-            num_proc=1
+        # Format and split
+        dataset = formatter.format_and_split(scenarios)
+        logger.info("✓ Data formatted and split (train/val/test)")
+        
+        # Tokenize
+        tokenized = formatter.prepare_tokenized_dataset(dataset, cfg['max_seq_length'])# max_seq_length=4096)
+        logger.info("✓ Data tokenized")
+        
+        # Save to disk
+        os.makedirs(cfg["llama_tokenized_cache"], exist_ok=True)
+        tokenized.save_to_disk(cfg["llama_tokenized_cache"])
+        logger.info(f"✓ Tokenized dataset saved to {cfg['llama_tokenized_cache']}")
+        
+    except Exception as e:
+        logger.error(f"Failed in formatting/tokenization: {e}")
+        raise
+
+    # ====== STAGE 3: TRAIN MODEL ======
+    logger.info(f"\n[STAGE 3] Training model...")
+    logger.info(f"Model will be automatically sharded across {torch.cuda.device_count()} GPUs")
+    
+    try:
+        trainer = ModelTrainer(
+            model_name=cfg["model_name"],
+            output_dir=cfg["model_output"]
+        )
+        trainer.load_model()
+        logger.info("Model loaded and sharded across GPUs")
+        
+        # Train with automatic multi-GPU sharding
+        trainer.train(
+            train_ds=tokenized["train"],
+            val_ds=tokenized["validation"],
+            num_epochs=cfg["epochs"],
+            lr=cfg["lr"],
+            batch_size=cfg["batch"],
+            grad_accum=cfg["grad_accum"]
         )
         
-        # Save tokenized dataset to disk for other ranks to load
-        if world_size > 1:
-            import tempfile
-            temp_dir = tempfile.mkdtemp(prefix="iomt_dataset_")
-            tokenized_dataset.save_to_disk(temp_dir)
-            dataset_path = temp_dir
-            logger.info(f"Saved tokenized dataset to {dataset_path}")
-        else:
-            dataset_path = None
-    else:
-        scenarios = None
-        tokenized_dataset = None
-        dataset_path = None
-    
-    # Broadcast dataset path to all ranks
-    if world_size > 1:
-        import torch.distributed as dist
-        
-        # Rank 0 broadcasts the path length and then the path
-        if rank == 0:
-            path_bytes = dataset_path.encode('utf-8')
-            path_len = torch.tensor([len(path_bytes)], dtype=torch.long).cuda()
-        else:
-            path_len = torch.tensor([0], dtype=torch.long).cuda()
-        
-        dist.broadcast(path_len, src=0)
-        
-        if rank == 0:
-            path_tensor = torch.tensor(list(path_bytes), dtype=torch.uint8).cuda()
-        else:
-            path_tensor = torch.zeros(path_len.item(), dtype=torch.uint8).cuda()
-        
-        dist.broadcast(path_tensor, src=0)
-        
-        if rank != 0:
-            dataset_path = bytes(path_tensor.cpu().numpy()).decode('utf-8')
-            from datasets import load_from_disk
-            tokenized_dataset = load_from_disk(dataset_path)
-            logger.info(f"[rank {rank}] Loaded tokenized dataset from {dataset_path}")
-        
-        dist.barrier()
-    
-    if rank == 0:
-        logger.info("3/5 TRAINING MODEL")
+    except Exception as e:
+        logger.error(f"Training failed: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
 
-    trainer_obj = ModelTrainer(cfg["model_name"], cfg["model_output"])
-    trainer_obj.load_model()
-    
-    # All ranks participate in training
-    trainer_obj.train(
-        tokenized_dataset["train"] if tokenized_dataset else None,
-        tokenized_dataset["validation"] if tokenized_dataset else None,
-        num_epochs=cfg["epochs"],
-        learning_rate=cfg["lr"],
-        batch_size=cfg["batch"],
-        grad_accum=cfg["grad_accum"]
-    )
-    
-    # Only rank 0 does policy generation and evaluation
-    if rank == 0:
-        logger.info("4/5 GENERATING SAMPLE POLICIES")
-        generator = PolicyGenerator(cfg["model_output"])
-        for scenario in scenarios[:3]:
-            logger.info(f"Generating policy for: {scenario.scenario_id}")
-            device_metadata = {
-                "device_type": scenario.device_type,
-                "criticality": scenario.criticality
-            }
-            policy = generator.generate(scenario.description, device_metadata)
-            validation = generator.validate_policy(policy)
-            logger.info(f"Valid XML: {validation['is_valid_xml']}, Has Target: {validation['has_target']}, Has Rules: {validation['has_rules']}")
-        
-        logger.info("5/5 EVALUATING MODEL")
-        evaluator = ModelEvaluator(generator)
-        metrics = evaluator.evaluate(scenarios, sample_size=cfg["eval_sample_size"])
-        
-        logger.info("="*60)
-        logger.info("PIPELINE COMPLETE - SUMMARY")
-        logger.info("="*60)
-        logger.info(f"Scenarios processed: {len(scenarios)}")
-        logger.info(f"Model saved to: {cfg['model_output']}")
-        logger.info(f"Training epochs: {cfg['epochs']}")
-        logger.info(f"Evaluation metrics: {metrics}")
-        logger.info("="*60)
-        
-        # Cleanup temporary dataset directory
-        if world_size > 1 and dataset_path:
-            import shutil
-            shutil.rmtree(dataset_path)
-    
-    if world_size > 1:
-        torch.distributed.destroy_process_group()
-
-    # If we initialized a single-process group earlier (world_size==1),
-    # try to destroy it to avoid resource-leak warnings. Guard with
-    # is_initialized check so this is a no-op when nothing was created.
+    # ====== STAGE 4: EVALUATE ======
+    logger.info(f"\n[STAGE 4] Evaluating model...")
     try:
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            torch.distributed.destroy_process_group()
-    except Exception:
-        # Best-effort cleanup; ignore failures during shutdown
-        pass
+        # Reload scenarios for evaluation
+        loader = DataLoader(cfg.get('data_dir', 'clinical_access_control_scenarios.csv'))
+        scenarios = loader.load()
+
+        gen = PolicyGenerator(cfg["model_output"])
+
+        # Sample policies
+        logger.info("Generating sample policies...")
+        for i, s in enumerate(scenarios[:min(3, len(scenarios))]):
+            try:
+                policy = gen.generate(
+                    s.description,
+                    {"device_type": s.device_type, "criticality": s.criticality}
+                )
+                val = gen.validate_policy(policy)
+                logger.info(f"  Sample {i+1}: Valid XML={val['is_valid_xml']}, "
+                           f"Target={val['has_target']}, Rules={val['has_rules']}")
+            except Exception as e:
+                logger.warning(f"  Sample {i+1} generation failed: {e}")
+        
+        # Full evaluation
+        logger.info(f"Running full evaluation on {cfg['eval_size']} scenarios...")
+        evaluator = ModelEvaluator(gen)
+        metrics = evaluator.evaluate(scenarios, sample_size=cfg['eval_size'])
+        
+        logger.info("\n" + "="*70)
+        logger.info("EVALUATION RESULTS")
+        logger.info("="*70)
+        logger.info(f"Valid XML Rate: {metrics['valid_xml_rate']:.1f}%")
+        logger.info(f"Has Target Rate: {metrics['has_target_rate']:.1f}%")
+        logger.info(f"Has Rules Rate: {metrics['has_rules_rate']:.1f}%")
+        
+        if 'avg_time' in metrics:
+            logger.info(f"Avg Generation Time: {metrics['avg_time']:.2f}s")
+        if 'median_time' in metrics:
+            logger.info(f"Median Generation Time: {metrics['median_time']:.2f}s")
+        
+        logger.info("="*70)
+        
+    except Exception as e:
+        logger.error(f"Evaluation failed: {e}")
+        import traceback
+        traceback.print_exc()
+
+    logger.info("\n✓ Pipeline complete!")
 
 if __name__ == "__main__":
-    # Try to determine rank early so logs are per-process
-    rank = int(os.environ.get("RANK", os.environ.get("SLURM_PROCID", "0")))
-
-    try:
-        main()
-    except Exception:
-        # Write full traceback to a per-rank file for easy debugging
-        log_path = f"/tmp/iomt_failure_rank{rank}.log"
-        with open(log_path, "w") as f:
-            traceback.print_exc(file=f)
-        # Also print to stderr/stdout so Slurm output captures it
-        traceback.print_exc()
-        # Re-raise so torchrun sees the child failed (keeps same behavior)
-        raise
+    main()
