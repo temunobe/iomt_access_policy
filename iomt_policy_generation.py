@@ -67,7 +67,7 @@ def main():
     if rank == 0:
         logger.info("\n[STAGE 1] Loading dataset...")
         try:
-            loader = DataLoader(config.get('data_dir', 'clinical_access_control_scenarios.csv'))
+            loader = DataLoader(config.get('data_dir', '/home/bsindala/projects/datasets/clinical_access_control_scenarios.csv'))
             scenarios = loader.load()
             logger.info(f"✓ Loaded {len(scenarios)} scenarios")
         except Exception as e:
@@ -81,7 +81,7 @@ def main():
     if rank == 0:
         logger.info("\n[STAGE 2] Formatting and tokenizing data...")
         try:
-            formatter = DataFormatter(cfg["model_name"])
+            formatter = DataFormatter(config["mistral_model_name"])
             logger.info("✓ Tokenizer loaded")
             
             # Format and split
@@ -93,10 +93,10 @@ def main():
             logger.info("✓ Data tokenized")
             
             # Save to disk for other ranks
-            os.makedirs(cfg["tokenized_cache"], exist_ok=True)
-            tokenized.save_to_disk(cfg["tokenized_cache"])
-            logger.info(f"✓ Tokenized dataset saved to {cfg['tokenized_cache']}")
-            
+            os.makedirs(config["tokenized_cache"], exist_ok=True)
+            tokenized.save_to_disk(config["tokenized_cache"])
+            logger.info(f"✓ Tokenized dataset saved to {config['tokenized_cache']}")
+
         except Exception as e:
             logger.error(f"Failed in formatting/tokenization: {e}")
             raise
@@ -109,7 +109,7 @@ def main():
     # ====== STAGE 3: LOAD TOKENIZED DATA (ALL RANKS) ======
     logger.info(f"\n[STAGE 3] Rank {rank} loading tokenized dataset...")
     try:
-        tokenized = load_from_disk(cfg["tokenized_cache"])
+        tokenized = load_from_disk(config["tokenized_cache"])
         logger.info(f"✓ Rank {rank} loaded tokenized dataset")
         logger.info(f"  Train samples: {len(tokenized['train'])}")
         logger.info(f"  Val samples: {len(tokenized['validation'])}")
@@ -129,8 +129,8 @@ def main():
     
     try:
         trainer = ModelTrainer(
-            model_name=cfg["model_name"],
-            output_dir=cfg["model_output"]
+            model_name=config["mistral_model_name"],
+            output_dir=config["mistral_model_output"]
         )
         trainer.load_model()
         logger.info(f"Rank {rank}: Model loaded")
@@ -139,10 +139,10 @@ def main():
         trainer.train(
             train_ds=tokenized["train"],
             val_ds=tokenized["validation"],
-            num_epochs=cfg["epochs"],
-            lr=cfg["lr"],
-            batch_size=cfg["batch"],
-            grad_accum=cfg["grad_accum"]
+            num_epochs=config["epochs"],
+            lr=config["lr"],
+            batch_size=config["batch"],
+            grad_accum=config["grad_accum"]
         )
         
     except Exception as e:
@@ -156,10 +156,10 @@ def main():
         logger.info(f"\n[STAGE 5] Evaluating model...")
         try:
             # Reload scenarios for evaluation
-            loader = DataLoader(cfg.get('dataset_csv', 'synthetic_iomt_dataset.csv'))
+            loader = DataLoader(config.get('data_dir', '/home/bsindala/projects/datasets/clinical_access_control_scenarios.csv'))
             scenarios = loader.load()
 
-            gen = PolicyGenerator(cfg["mistral_model_output"])
+            gen = PolicyGenerator(config.get("mistral_model_output", './mistral7b_model_v1'))
 
             # Sample policies
             logger.info("Generating sample policies...")
@@ -176,9 +176,9 @@ def main():
                     logger.warning(f"  Sample {i+1} generation failed: {e}")
             
             # Full evaluation with comprehensive metrics
-            logger.info(f"Running full evaluation on {cfg['eval_size']} scenarios...")
+            logger.info(f"Running full evaluation on {config['eval_size']} scenarios...")
             evaluator = ModelEvaluator(gen)
-            metrics = evaluator.evaluate(scenarios, sample_size=cfg['eval_size'])
+            metrics = evaluator.evaluate(scenarios, sample_size=config['eval_size'])
             
             # Print detailed report
             evaluator.print_detailed_report(metrics)

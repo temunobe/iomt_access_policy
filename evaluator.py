@@ -5,7 +5,7 @@ import time
 import numpy as np
 from tqdm import tqdm
 from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score
-from xml.etree.ElementTree import ET
+import xml.etree.ElementTree as ET
 import re
 
 logger = logging.getLogger(__name__)
