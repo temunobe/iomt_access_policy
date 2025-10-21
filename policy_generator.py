@@ -124,13 +124,17 @@ class PolicyGenerator:
             root = ET.fromstring(xml_str)
             result["is_valid_xml"] = True
             
-            # Check for Target element (with or without namespace)
-            target = root.find(".//*[local-name()='Target']")
-            result["has_target"] = target is not None
-            
-            # Check for Rule elements (with or without namespace)
-            rules = root.findall(".//*[local-name()='Rule']")
-            result["has_rules"] = len(rules) > 0
+            # Check for Target and Rule elements (handle namespaces)
+            for elem in root.iter():
+                tag = elem.tag.split('}')[-1]  # Remove namespace if present
+                if tag == 'Target':
+                    result["has_target"] = True
+                elif tag == 'Rule':
+                    result["has_rules"] = True
+                
+                # Early exit if both found
+                if result["has_target"] and result["has_rules"]:
+                    break
             
         except ET.ParseError as e:
             result["error"] = f"XML Parse Error: {str(e)}"
