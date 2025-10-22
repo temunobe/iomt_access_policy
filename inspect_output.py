@@ -57,7 +57,7 @@ def main():
     scenarios = loader.load()
     
     # Load generator
-    model_path = config.get("mistral_model_output", "./mistral7b_model_v1")
+    model_path = config.get("mistral_model_output", "./mistral7b_model_v2")
     gen = PolicyGenerator(model_path)
     
     # Test 3 scenarios
