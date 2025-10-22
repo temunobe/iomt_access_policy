@@ -15,14 +15,14 @@ def main():
     
     # Load test scenarios
     print("\n1. Loading test scenarios...")
-    loader = DataLoader(config.get('data_dir', '/home/bsindala/projects/datasets/clinical_access_control_scenarios.csv'))
+    loader = DataLoader(config.get('data_dir', '/home/bsindala/projects/datasets/clinical_access_control_scenarios_1M.csv'))
     scenarios = loader.load()
     
     print(f"   ✓ Loaded {len(scenarios)} scenarios")
     
     # Load model
     print("\n2. Loading trained model...")
-    model_path = config.get("mistral_model_output", "./mistral7b_model_v1")
+    model_path = config.get("mistral_model_output", "./mistral7b_model_v3")
     
     if not os.path.exists(model_path):
         print(f"   ✗ ERROR: Model not found at {model_path}")

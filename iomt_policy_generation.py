@@ -45,16 +45,16 @@ def main():
     if rank != 0:
         logging.getLogger().setLevel(logging.WARNING)
 
-    cfg = {
-        "model_name": "mistralai/Mistral-7B-Instruct-v0.2",
-        "model_output": "./mistral7b_model",
-        "tokenized_cache": "./tokenized_dataset_cache",
-        "epochs": 1,  # Reduced for memory
-        "lr": 1e-5,
-        "batch": 1,
-        "grad_accum": 8,  # Reduced from 16
-        "eval_size": 50   # Reduced from 100
-    }
+    # cfg = {
+    #     "model_name": "mistralai/Mistral-7B-Instruct-v0.2",
+    #     "model_output": "./mistral7b_model_v3",
+    #     "tokenized_cache": "./tokenized_dataset_cache",
+    #     "epochs": 1,  # Reduced for memory
+    #     "lr": 1e-5,
+    #     "batch": 1,
+    #     "grad_accum": 8,  # Reduced from 16
+    #     "eval_size": 50   # Reduced from 100
+    # }
 
     if rank == 0:
         logger.info("="*70)
@@ -67,7 +67,7 @@ def main():
     if rank == 0:
         logger.info("\n[STAGE 1] Loading dataset...")
         try:
-            loader = DataLoader(config.get('data_dir', '/home/bsindala/projects/datasets/clinical_access_control_scenarios.csv'))
+            loader = DataLoader(config.get('data_dir', '/home/bsindala/projects/datasets/clinical_access_control_scenarios_1M.csv'))
             scenarios = loader.load()
             logger.info(f"✓ Loaded {len(scenarios)} scenarios")
         except Exception as e:
@@ -156,10 +156,10 @@ def main():
         logger.info(f"\n[STAGE 5] Evaluating model...")
         try:
             # Reload scenarios for evaluation
-            loader = DataLoader(config.get('data_dir', '/home/bsindala/projects/datasets/clinical_access_control_scenarios.csv'))
+            loader = DataLoader(config.get('data_dir', '/home/bsindala/projects/datasets/clinical_access_control_scenarios_1M.csv'))
             scenarios = loader.load()
 
-            gen = PolicyGenerator(config.get("mistral_model_output", './mistral7b_model_v1'))
+            gen = PolicyGenerator(config.get("mistral_model_output", './mistral7b_model_v3'))
 
             # Sample policies
             logger.info("Generating sample policies...")
