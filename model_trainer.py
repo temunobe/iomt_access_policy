@@ -126,8 +126,8 @@ class ModelTrainer:
         """Train with gradient checkpointing (single process)"""
         
         eval_strategy = "steps" if val_ds is not None else "no"
-        eval_steps = 50 if val_ds is not None else None
-        logging_steps = 10
+        eval_steps = 5000 if val_ds is not None else None
+        logging_steps = 100
 
         args = TrainingArguments(
             output_dir=self.output_dir,
@@ -146,7 +146,7 @@ class ModelTrainer:
             eval_strategy=eval_strategy,
             eval_steps=eval_steps if eval_steps is not None else 0,
             save_strategy="steps" if val_ds is not None else "no",
-            save_steps=100 if val_ds is not None else None,
+            save_steps=10000 if val_ds is not None else None,
             save_total_limit=2,
             load_best_model_at_end=True if val_ds is not None else False,
             max_grad_norm=1.0,

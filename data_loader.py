@@ -17,7 +17,7 @@ class DataLoader:
     def __init__(self, csv_path: str):
         self.csv_path = csv_path
 
-    def load(self) -> List[PolicyScenario]:
+    def load(self, sample_size: Optional[int] = None) -> List[PolicyScenario]:
         """Load dataset from CSV"""
         logger.info(f"Loading dataset from {self.csv_path}...")
 
@@ -28,6 +28,11 @@ class DataLoader:
         except Exception as e:
             logger.warning(f"Automatic delimiter detection failed: {e}. Falling back to comma delimiter.")
             df = pd.read_csv(self.csv_path, sep=',', skipinitialspace=True)
+
+        # Sample Size
+        if sample_size and len(df) > sample_size:
+            logger.info(f"Sampling {sample_size} scenarios from dataset of size {len(df)}...")
+            df = df.sample(n=sample_size, random_state=42)
 
         # If parsed as single column (header joined), try reparsing using comma
         if len(df.columns) == 1:

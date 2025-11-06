@@ -67,8 +67,8 @@ def main():
     if rank == 0:
         logger.info("\n[STAGE 1] Loading dataset...")
         try:
-            loader = DataLoader(config.get('data_dir', '/home/bsindala/projects/datasets/clinical_access_control_scenarios_1M.csv'))
-            scenarios = loader.load()
+            loader = DataLoader(config.get('data_dir', '../datasets/clinical_access_control_scenarios_1M.csv'))
+            scenarios = loader.load(sample_size=config.get('sample_size', None))
             logger.info(f"✓ Loaded {len(scenarios)} scenarios")
         except Exception as e:
             logger.error(f"Failed to load dataset: {e}")
@@ -156,10 +156,10 @@ def main():
         logger.info(f"\n[STAGE 5] Evaluating model...")
         try:
             # Reload scenarios for evaluation
-            loader = DataLoader(config.get('data_dir', '/home/bsindala/projects/datasets/clinical_access_control_scenarios_1M.csv'))
+            loader = DataLoader(config.get('data_dir', '../datasets/clinical_access_control_scenarios_1M.csv'))
             scenarios = loader.load()
 
-            gen = PolicyGenerator(config.get("mistral_model_output", './mistral7b_model_v3'))
+            gen = PolicyGenerator(config.get("mistral_model_output", './mistral7b_model_v3_1'))
 
             # Sample policies
             logger.info("Generating sample policies...")

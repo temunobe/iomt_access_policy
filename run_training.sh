@@ -4,6 +4,9 @@
 # Exit on error
 set -e
 
+# Output log
+exec > >(tee -a training_log.log) 2>&1
+
 echo "=========================================="
 echo "Llama 4 Scout 17B 16E Training"
 echo "=========================================="
@@ -54,6 +57,7 @@ echo ""
 
 # Run as single process - device_map="auto" handles multi-GPU
 python iomt_policy_generation.py
+#accelerate launch --multi_gpu --num_processes 2 iomt_policy_generation.py
 
 echo ""
 echo "=========================================="

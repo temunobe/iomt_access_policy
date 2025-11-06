@@ -3,7 +3,7 @@ import random
 import string
 
 # Configuration
-output_file = "/home/bsindala/projects/datasets/clinical_access_control_scenarios_1M.csv"
+output_file = "../datasets/clinical_access_control_scenarios_1M.csv"
 num_scenarios = 1_000_000
 
 # Reference data
