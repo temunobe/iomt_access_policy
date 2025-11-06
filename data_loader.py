@@ -6,6 +6,7 @@ import logging
 from typing import List
 import pandas as pd
 from tqdm import tqdm
+from typing import Optional
 
 from schemas import PolicyScenario
 
