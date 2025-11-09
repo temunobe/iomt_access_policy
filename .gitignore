@@ -12,8 +12,11 @@ mistral7b_model_200K_v2/
 llama4_model/
 tokenized_dataset_cache/
 mistral7b_model_200K_v1/
+mistral7b_model_200K_v2/
+mistral7b_model_200K_v3/
 tokenized_dataset_cache_200K/
 tokenized_dataset_cache_1M_v1/
+tokenized_dataset_cache_1M_v2/
 __pycache__/
 
 Assignment_5_TSP_BonifaceSindala.py

@@ -53,11 +53,11 @@ def main():
     print("="*80)
     
     # Load scenarios
-    loader = DataLoader(config.get('data_dir', '../datasets/clinical_access_control_scenarios_1M.csv'))
+    loader = DataLoader(config.get('data_dir', '../datasets/clinical_access_control_scenarios.csv'))
     scenarios = loader.load()
     
     # Load generator
-    model_path = config.get("mistral_model_output", "./mistral7b_model_v3_1")
+    model_path = config.get("mistral_model_output", "./mistral7b_model")
     gen = PolicyGenerator(model_path)
     
     # Test 3 scenarios

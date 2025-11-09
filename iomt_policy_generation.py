@@ -89,7 +89,7 @@ def main():
             logger.info("✓ Data formatted and split (train/val/test)")
             
             # Tokenize
-            tokenized = formatter.prepare_tokenized_dataset(dataset, max_seq_length=4096)
+            tokenized = formatter.prepare_tokenized_dataset(dataset, max_seq_length=config.get("max_seq_length", 4096))
             logger.info("✓ Data tokenized")
             
             # Save to disk for other ranks
@@ -128,9 +128,19 @@ def main():
         logger.info(f"Using FSDP to shard model across {world_size} GPUs")
     
     try:
+        # Choose model name from config: prefer `model_name` (e.g. Llama) but fall
+        # back to `mistral_model_name` for this branch.
+        chosen_model = config.get("model_name") or config.get("mistral_model_name")
+        chosen_output = config.get("model_output") or config.get("mistral_model_output")
+
         trainer = ModelTrainer(
-            model_name=config["mistral_model_name"],
-            output_dir=config["mistral_model_output"]
+            model_name=chosen_model,
+            output_dir=chosen_output,
+            bf16=config.get("bf16", False),
+            gradient_checkpointing=config.get("gradient_checkpointing", False),
+            lora_r=config.get("lora_r", 8),
+            lora_alpha=config.get("lora_alpha", 16),
+            use_bnb=config.get("use_bnb", True),
         )
         trainer.load_model()
         logger.info(f"Rank {rank}: Model loaded")

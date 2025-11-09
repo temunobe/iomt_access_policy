@@ -18,7 +18,7 @@ class DataLoader:
     def __init__(self, csv_path: str):
         self.csv_path = csv_path
 
-    def load(self, sample_size: Optional[int] = None) -> List[PolicyScenario]:
+    def load(self, sample_size: Optional[int] = None, dedupe: bool = True) -> List[PolicyScenario]:
         """Load dataset from CSV"""
         logger.info(f"Loading dataset from {self.csv_path}...")
 
@@ -109,7 +109,7 @@ class DataLoader:
             try:
                 description_value = row[col_mapping['description']] if pd.notna(row[col_mapping['description']]) else ""
                 safety_display_value = row[col_mapping['safety_display']] if pd.notna(row[col_mapping['safety_display']]) else ""
-
+                # extract and canonicalize structured fields
                 patient_acuity = self._extract_acuity(str(description_value))
                 emergency_status = self._extract_emergency_status(str(description_value))
                 care_team_size = self._extract_care_team_size(str(description_value))
@@ -117,6 +117,12 @@ class DataLoader:
                     str(description_value),
                     str(safety_display_value)
                 )
+
+                raw_criticality = row[col_mapping['criticality']]
+                criticality_val = self._canonicalize_criticality(raw_criticality)
+
+                raw_policy = row[col_mapping['access_policy']] if pd.notna(row[col_mapping['access_policy']]) else ""
+                cleaned_policy = self._clean_label(raw_policy)
 
                 scenario = PolicyScenario(
                     scenario_id=row[col_mapping['scenario_id']],
@@ -131,8 +137,8 @@ class DataLoader:
                     location=row[col_mapping['location']],
                     safety_code=row[col_mapping['safety_code']],
                     safety_display=safety_display_value,
-                    criticality=row[col_mapping['criticality']],
-                    access_policy=row[col_mapping['access_policy']],
+                    criticality=criticality_val,
+                    access_policy=cleaned_policy,
                     patient_acuity=patient_acuity,
                     emergency_status=emergency_status,
                     care_team_size=care_team_size,
@@ -142,6 +148,16 @@ class DataLoader:
             except Exception as e:
                 logger.error(f"Error processing row {idx}: {e}")
                 raise
+
+        # Optionally deduplicate scenarios based on normalized description + device
+        if dedupe:
+            before = len(scenarios)
+            scenarios = self._dedupe_scenarios(scenarios)
+            after = len(scenarios)
+            logger.info(f"Deduplicated scenarios: {before} -> {after}")
+
+        # Print label distribution for access_policy to help debugging class balance
+        self._print_label_distribution(scenarios)
 
         self._print_statistics(scenarios)
         logger.info(f"✓ Successfully processed {len(scenarios)} scenarios")
@@ -227,3 +243,61 @@ class DataLoader:
         emergency_count = sum(1 for s in scenarios if s.emergency_status == 'YES')
         logger.info(f"Emergency Scenarios: {emergency_count} ({emergency_count/len(scenarios)*100:.1f}%)")
         logger.info("="*60 + "\n")
+
+    def _clean_label(self, label: str) -> str:
+        """Clean access_policy label: strip, remove XML tags and normalize whitespace."""
+        if label is None:
+            return "UNKNOWN"
+        lab = str(label).strip()
+        if lab == "":
+            return "UNKNOWN"
+        # remove simple XML/HTML tags
+        lab = re.sub(r'<[^>]+>', '', lab)
+        # collapse whitespace
+        lab = re.sub(r'\s+', ' ', lab).strip()
+        return lab
+
+    def _canonicalize_criticality(self, val) -> str:
+        if val is None:
+            return 'MEDIUM'
+        v = str(val).strip().lower()
+        mapping = {
+            'critical': 'CRITICAL', 'life_supporting': 'LIFE_SUPPORTING', 'life supporting': 'LIFE_SUPPORTING',
+            'monitoring': 'MONITORING', 'therapeutic': 'THERAPEUTIC', 'administrative': 'ADMINISTRATIVE',
+            'diagnostic': 'DIAGNOSTIC', 'high': 'HIGH', 'medium': 'MEDIUM', 'low': 'LOW'
+        }
+        # normalize common tokens
+        for k, vv in mapping.items():
+            if k in v:
+                return vv
+        return v.upper()
+
+    def _normalize_text(self, text: str) -> str:
+        if not text:
+            return ""
+        t = re.sub(r'\s+', ' ', text).strip().lower()
+        return t
+
+    def _dedupe_scenarios(self, scenarios: List[PolicyScenario]) -> List[PolicyScenario]:
+        seen = set()
+        out = []
+        removed = 0
+        for s in scenarios:
+            key = (self._normalize_text(s.description), str(s.device_id))
+            if key in seen:
+                removed += 1
+                continue
+            seen.add(key)
+            out.append(s)
+        if removed > 0:
+            logger.info(f"Removed {removed} duplicate scenarios")
+        return out
+
+    def _print_label_distribution(self, scenarios: List[PolicyScenario], top_n: int = 20):
+        counts = {}
+        for s in scenarios:
+            lab = s.access_policy if s.access_policy else 'UNKNOWN'
+            counts[lab] = counts.get(lab, 0) + 1
+        logger.info("Access policy label distribution (top %d):", top_n)
+        for lab, cnt in sorted(counts.items(), key=lambda x: x[1], reverse=True)[:top_n]:
+            logger.info(f"  {lab}: {cnt}")

@@ -56,6 +56,7 @@ echo ""
 #python test_model_load.py
 
 # Run as single process - device_map="auto" handles multi-GPU
+source ./iomtenv/bin/activate
 python iomt_policy_generation.py
 #accelerate launch --multi_gpu --num_processes 2 iomt_policy_generation.py
 

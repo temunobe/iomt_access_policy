@@ -12,13 +12,39 @@ import importlib
 logger = logging.getLogger(__name__)
 
 class ModelTrainer:
-    def __init__(self, model_name: str = "mistralai/Mistral-7B-Instruct-v0.2", output_dir: str = "./mistral7b_model"):
+    def __init__(
+        self,
+        model_name: str = "mistralai/Mistral-7B-Instruct-v0.2",
+        output_dir: str = "./mistral7b_model",
+        *,
+        bf16: bool = False,
+        gradient_checkpointing: bool = False,
+        lora_r: int = 8,
+        lora_alpha: int = 16,
+        use_bnb: bool = True,
+    ):
+        """Model trainer with safer, configurable defaults.
+
+        Args:
+            model_name: model path or HF id
+            output_dir: dir to save checkpoints
+            bf16: use bfloat16 during training (requires hardware support)
+            gradient_checkpointing: enable gradient checkpointing (saves memory)
+            lora_r, lora_alpha: LoRA hyperparameters
+            use_bnb: attempt BitsAndBytes quantized loading when available
+        """
         self.model_name = model_name
         self.output_dir = output_dir
         self.rank = int(os.environ.get("RANK", 0))
         self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
         self.world_size = int(os.environ.get("WORLD_SIZE", 1))
         self.hf_token = os.environ.get("HUGGINGFACE_HUB_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
+
+        self.bf16 = bf16
+        self.gradient_checkpointing = gradient_checkpointing
+        self.lora_r = lora_r
+        self.lora_alpha = lora_alpha
+        self.use_bnb = use_bnb
 
         local = os.path.exists(model_name)
         tokenizer_kwargs = {"trust_remote_code": True, "local_files_only": local}
@@ -52,9 +78,9 @@ class ModelTrainer:
         if self.hf_token:
             hf_kwargs["use_auth_token"] = self.hf_token
 
-        # Try quantization if bitsandbytes is available
+        # Try quantization if bitsandbytes is available and allowed
         quantization_successful = False
-        if self._bnb_importable():
+        if self.use_bnb and self._bnb_importable():
             try:
                 logger.info("Attempting 4-bit quantized load...")
                 bnb_cfg = BitsAndBytesConfig(
@@ -67,7 +93,7 @@ class ModelTrainer:
                     self.model_name,
                     quantization_config=bnb_cfg,
                     device_map=device_map,
-                    torch_dtype=torch.bfloat16,
+                    torch_dtype=(torch.bfloat16 if self.bf16 and torch.cuda.is_available() else None),
                     **hf_kwargs
                 )
                 self.model = prepare_model_for_kbit_training(self.model)
@@ -79,12 +105,12 @@ class ModelTrainer:
 
         # Fallback to non-quantized if quantization failed or unavailable
         if not quantization_successful:
-            logger.info("Loading model without quantization in bfloat16...")
-            logger.info("With 2 GPUs available, model will be automatically sharded across both")
+            dtype = torch.bfloat16 if (self.bf16 and torch.cuda.is_available()) else None
+            logger.info(f"Loading model without quantization (dtype={dtype})")
             self.model = AutoModelForCausalLM.from_pretrained(
                 self.model_name,
                 device_map=device_map,
-                torch_dtype=torch.bfloat16,
+                torch_dtype=dtype,
                 **hf_kwargs
             )
             logger.info("✓ Model loaded without quantization")
@@ -98,36 +124,38 @@ class ModelTrainer:
         if trainable == 0:
             raise RuntimeError("ERROR: No trainable parameters after LoRA! Training cannot proceed.")
 
-    def _apply_lora(self):
-        """Apply LoRA adapters - must succeed"""
+    def _apply_lora(self, r: int = 8, alpha: int = 16):
+        """Apply LoRA adapters with configurable hyperparameters."""
         cfg = LoraConfig(
-            r=8,  # Smaller rank for memory efficiency
-            lora_alpha=16,
+            r=r,
+            lora_alpha=alpha,
             target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
             lora_dropout=0.05,
             bias="none",
             task_type="CAUSAL_LM"
         )
-        
         try:
             model = get_peft_model(self.model, cfg)
         except Exception as e:
             logger.error(f"Failed to apply LoRA: {e}")
             raise
-        
+
         # Log trainable params
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
         total = sum(p.numel() for p in model.parameters())
         logger.info(f"Trainable params: {trainable:,} / {total:,} ({trainable/total*100:.2f}%)")
-        
+
         return model
 
     def train(self, train_ds, val_ds, num_epochs=3, lr=1e-5, batch_size=1, grad_accum=2):
-        """Train with gradient checkpointing (single process)"""
-        
+        """Train with configurable options and safer defaults."""
+
         eval_strategy = "steps" if val_ds is not None else "no"
         eval_steps = 5000 if val_ds is not None else None
         logging_steps = 100
+
+        effective_batch = batch_size * grad_accum
+        logger.info(f"Training config: epochs={num_epochs}, per_device_batch={batch_size}, grad_accum={grad_accum}, effective_batch={effective_batch}, lr={lr}")
 
         args = TrainingArguments(
             output_dir=self.output_dir,
@@ -135,13 +163,13 @@ class ModelTrainer:
             per_device_train_batch_size=batch_size,
             per_device_eval_batch_size=1,
             gradient_accumulation_steps=grad_accum,
-            gradient_checkpointing=True,  # Enable for single-process training
+            gradient_checkpointing=self.gradient_checkpointing,
             learning_rate=lr,
             weight_decay=0.01,
             warmup_ratio=0.05,
             lr_scheduler_type="cosine_with_restarts",
             optim="adamw_torch_fused" if torch.cuda.is_available() else "adamw_torch",
-            bf16=True,
+            bf16=self.bf16,
             logging_steps=logging_steps,
             eval_strategy=eval_strategy,
             eval_steps=eval_steps if eval_steps is not None else 0,
@@ -152,6 +180,7 @@ class ModelTrainer:
             max_grad_norm=1.0,
             remove_unused_columns=False,
             dataloader_pin_memory=False,
+            report_to=[],  # disable integrations by default
             # NO FSDP for single process
         )
 
@@ -164,7 +193,14 @@ class ModelTrainer:
         )
 
         logger.info("Starting training...")
-        trainer.train()
+        try:
+            trainer.train()
+        except Exception as e:
+            logger.error("Training failed: %s", e)
+            # Helpful debug hints
+            if "CUDA error" in str(e) or "cuda" in str(e).lower():
+                logger.error("CUDA error during training. Try: 1) CUDA_LAUNCH_BLOCKING=1 for deterministic stack traces; 2) set bf16=False; 3) reduce batch size or disable quantization/offload.")
+            raise
 
         trainer.save_model(self.output_dir)
         self.tokenizer.save_pretrained(self.output_dir)
